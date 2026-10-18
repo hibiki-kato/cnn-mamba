@@ -15,6 +15,7 @@ import numpy as np
 import pysam
 import torch
 
+from .checkpoint_provenance import checkpoint_progress
 from .model import model_from_checkpoint
 
 ENCODE = np.full(256, 4, dtype=np.uint8)
@@ -156,7 +157,7 @@ def main() -> None:
             array.flush()
     metadata = {
         "schema": "droso_chrx_all_candidate_scores_v1", "checkpoint": str(args.checkpoint.resolve()),
-        "checkpoint_step": checkpoint["optimizer_step"], "checkpoint_epoch": None,
+        **checkpoint_progress(checkpoint),
         "fasta": str(args.fasta.resolve()), "chromosome": args.display_chrom,
         "fasta_sequence_name": args.chrom, "chromosome_length": chrom_len,
         "strand": "+", "window_size": window, "stride": stride,
