@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba3
 from torch.utils.checkpoint import checkpoint
 
+from .gene_hmm import STATE_CLASSES, GeneHMM
+
 
 class BiMamba3Block(nn.Module):
     def __init__(self, d_model: int, d_state: int, headdim: int):
@@ -82,7 +84,8 @@ class SpliceMamba(nn.Module):
     def __init__(self, d_model=192, d_state=64, n_layers=8, dropout=0.1,
                  architecture="cnn_mamba", cnn_kernel_size=7,
                  frame_dilation=0, phase_auxiliary=False,
-                 cds_auxiliary=False, joint_frame_auxiliary=False):
+                 cds_auxiliary=False, joint_frame_auxiliary=False,
+                 gene_hmm=False):
         super().__init__()
         if architecture not in {"mamba", "cnn_mamba"}:
             raise ValueError(f"unsupported architecture: {architecture}")
@@ -127,10 +130,14 @@ class SpliceMamba(nn.Module):
         self.joint_frame_head = (
             nn.Linear(d_model, 4) if joint_frame_auxiliary else None
         )
+        self.state_head = (
+            nn.Linear(d_model, len(STATE_CLASSES)) if gene_hmm else None
+        )
+        self.gene_hmm = GeneHMM() if gene_hmm else None
 
     def forward(
         self, sequence, return_phase=False, return_cds=False,
-        return_joint_frame=False,
+        return_joint_frame=False, return_states=False,
     ):
         x = self.embed_drop(self.input_proj(self.embedding(sequence)))
         if self.architecture == "mamba":
@@ -160,6 +167,10 @@ class SpliceMamba(nn.Module):
                     "joint_frame_auxiliary=True"
                 )
             outputs += (self.joint_frame_head(start_stop_features),)
+        if return_states:
+            if self.state_head is None:
+                raise RuntimeError("state output requested without gene_hmm=True")
+            outputs += (self.state_head(start_stop_features),)
         return outputs
 
 
@@ -182,6 +193,10 @@ def model_from_checkpoint(saved, device=None):
             bool(config.get("joint_frame_auxiliary", False))
             or config.get("joint_frame_aux_weight", 0.0) > 0
             or any(name.startswith("joint_frame_head.") for name in state)
+        ),
+        gene_hmm=(
+            config.get("hmm_loss_weight", 0.0) > 0
+            or any(name.startswith("state_head.") for name in state)
         ),
     )
     model.load_state_dict(state)

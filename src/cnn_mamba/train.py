@@ -34,7 +34,7 @@ SEED = 42
 class PUDataset(Dataset):
     def __init__(
         self, directory, require_phase=False, require_cds=False,
-        require_cds_boundary=False,
+        require_cds_boundary=False, require_path=False,
     ):
         directories = directory if isinstance(directory, (list, tuple)) else [directory]
         self.files = sorted(
@@ -46,6 +46,7 @@ class PUDataset(Dataset):
         self.require_phase = require_phase
         self.require_cds = require_cds
         self.require_cds_boundary = require_cds_boundary
+        self.require_path = require_path
         if require_cds_boundary and not require_cds:
             raise ValueError("CDS boundary masks require CDS labels")
 
@@ -112,6 +113,16 @@ class PUDataset(Dataset):
                     arrays.append(
                         torch.from_numpy(data[key].astype(np.int64, copy=False))
                     )
+            if self.require_path:
+                # Always last so the historical positional layout is unchanged.
+                if "path_labels" not in data:
+                    raise KeyError(
+                        f"missing path array 'path_labels' in {self.files[index]}; "
+                        "regenerate with --include-path-labels"
+                    )
+                arrays.append(torch.from_numpy(
+                    data["path_labels"].astype(np.int64, copy=False)
+                ))
             return tuple(arrays)
 
 
@@ -182,6 +193,16 @@ def boundary_weighted_cds_loss(logits, labels, boundary_mask, far_weight=0.1):
     return loss
 
 
+def gene_hmm_loss(model, sequence, splice_logits, ss_logits, state_logits, path_labels):
+    """Mean per-base CRF NLL over windows whose labels admit a path."""
+    nll, feasible = model.gene_hmm(
+        sequence, splice_logits, ss_logits, state_logits, path_labels
+    )
+    if not feasible.any():
+        return splice_logits.sum() * 0.0, int((~feasible).sum().item())
+    return nll[feasible].mean(), int((~feasible).sum().item())
+
+
 def shared_backbone_gradient_norm(loss, parameters, retain_graph=True):
     """Return the unscaled L2 gradient norm without modifying ``.grad`` fields."""
     gradients = torch.autograd.grad(
@@ -200,14 +221,21 @@ def evaluate(
     splice_loss_weight=0.25, phase_aux_weight=0.0, cds_aux_weight=0.0,
     cds_boundary_radius=0, cds_far_loss_weight=0.1,
     joint_frame_aux_weight=0.0, joint_noncoding_weight=0.1,
+    hmm_loss_weight=0.0,
 ):
     model.eval()
     curves = {name: BinnedPR() for name in ("donor", "acceptor", "start", "stop")}
+    hmm_curves = (
+        {name: BinnedPR() for name in ("donor", "acceptor", "start", "stop")}
+        if hmm_loss_weight > 0 else None
+    )
+    hmm_cds_curve = BinnedPR() if hmm_loss_weight > 0 else None
+    hmm_infeasible = 0
     cds_curve = BinnedPR() if cds_aux_weight > 0 else None
     joint_cds_curve = BinnedPR() if joint_frame_aux_weight > 0 else None
     totals = {
         "loss": 0.0, "splice": 0.0, "ss": 0.0,
-        "phase": 0.0, "cds": 0.0, "joint_frame": 0.0,
+        "phase": 0.0, "cds": 0.0, "joint_frame": 0.0, "hmm": 0.0,
     }
     batches = 0
     for batch in loader:
@@ -217,12 +245,13 @@ def evaluate(
         with autocast("cuda", enabled=use_amp):
             if (
                 phase_aux_weight > 0 or cds_aux_weight > 0
-                or joint_frame_aux_weight > 0
+                or joint_frame_aux_weight > 0 or hmm_loss_weight > 0
             ):
                 outputs = model(
                     sequence, return_phase=phase_aux_weight > 0,
                     return_cds=cds_aux_weight > 0,
                     return_joint_frame=joint_frame_aux_weight > 0,
+                    return_states=hmm_loss_weight > 0,
                 )
                 splice_logits, ss_logits = outputs[:2]
                 output_index = 2
@@ -279,6 +308,15 @@ def evaluate(
             else:
                 joint_logits = None
                 joint_frame_loss = splice_logits.sum() * 0.0
+            if hmm_loss_weight > 0:
+                state_logits = outputs[-1]
+                hmm_loss, infeasible = gene_hmm_loss(
+                    model, sequence, splice_logits, ss_logits, state_logits,
+                    batch[-1].to(device, non_blocking=True),
+                )
+                hmm_infeasible += infeasible
+            else:
+                hmm_loss = splice_logits.sum() * 0.0
             splice_loss = candidate_loss(
                 splice_logits, chess_splice, sequence, "splice"
             )
@@ -290,6 +328,7 @@ def evaluate(
                 + phase_aux_weight * phase_loss
                 + cds_aux_weight * cds_loss
                 + joint_frame_aux_weight * joint_frame_loss
+                + hmm_loss_weight * hmm_loss
             )
         totals["loss"] += float(loss.item())
         totals["splice"] += float(splice_loss.item())
@@ -297,6 +336,7 @@ def evaluate(
         totals["phase"] += float(phase_loss.item())
         totals["cds"] += float(cds_loss.item())
         totals["joint_frame"] += float(joint_frame_loss.item())
+        totals["hmm"] += float(hmm_loss.item())
         batches += 1
         splice_probability = splice_logits.softmax(-1)
         ss_probability = ss_logits.softmax(-1)
@@ -311,6 +351,24 @@ def evaluate(
             ("stop", ss_probability, chess_ss, stop & center, 2),
         ):
             curves[name].add(probability[..., cls][mask].float(), labels[mask] == cls)
+        if hmm_curves is not None:
+            states, events = model.gene_hmm.posteriors(
+                sequence, splice_logits, ss_logits, state_logits
+            )
+            for name, labels, mask, cls in (
+                ("donor", chess_splice, gt & center, 1),
+                ("acceptor", chess_splice, ag & center, 2),
+                ("start", chess_ss, atg & center, 1),
+                ("stop", chess_ss, stop & center, 2),
+            ):
+                hmm_curves[name].add(
+                    events[name][mask].clamp(0, 1), labels[mask] == cls
+                )
+            if reference_cds is not None:
+                hmm_cds_curve.add(
+                    states[..., 1:4].sum(-1)[center].clamp(0, 1),
+                    reference_cds[center].bool(),
+                )
         if cds_curve is not None:
             cds_curve.add(
                 cds_logits.softmax(-1)[..., 1][center].float(),
@@ -327,6 +385,13 @@ def evaluate(
         metrics["cds"] = cds_curve.metrics()
     if joint_cds_curve is not None:
         metrics["joint_cds"] = joint_cds_curve.metrics()
+    if hmm_curves is not None:
+        metrics["hmm"] = {name: curve.metrics() for name, curve in hmm_curves.items()}
+        metrics["mean_AP_hmm"] = sum(
+            row["AP"] for row in metrics["hmm"].values()
+        ) / len(hmm_curves)
+        if hmm_cds_curve.positive.sum():
+            metrics["hmm_cds"] = hmm_cds_curve.metrics()
     losses = {
         "loss": totals["loss"] / batches,
         "splice_loss": totals["splice"] / batches,
@@ -334,6 +399,8 @@ def evaluate(
         "phase_loss": totals["phase"] / batches,
         "cds_loss": totals["cds"] / batches,
         "joint_frame_loss": totals["joint_frame"] / batches,
+        "hmm_loss": totals["hmm"] / batches,
+        "hmm_infeasible_windows": hmm_infeasible,
     }
     return metrics, losses
 
@@ -407,6 +474,27 @@ def main():
             "the four-state joint-frame loss."
         ),
     )
+    parser.add_argument(
+        "--hmm-loss-weight", type=float, default=0.0,
+        help=(
+            "Weight of the gene-HMM CRF negative log-likelihood (per base) on "
+            "longest-CDS path labels; adds a five-class state head."
+        ),
+    )
+    parser.add_argument(
+        "--hmm-init-checkpoint", type=Path,
+        help=(
+            "Initialise matching parameters from this checkpoint before "
+            "training; a joint-frame head seeds the HMM state head."
+        ),
+    )
+    parser.add_argument(
+        "--selection-metric", choices=("raw", "hmm"), default="raw",
+        help=(
+            "Validation mean AP used for best_model.pt and early stopping: "
+            "raw head probabilities or HMM posterior site marginals."
+        ),
+    )
     parser.add_argument("--window-size", type=int, default=10000)
     parser.add_argument("--stride", type=int, default=5000)
     parser.add_argument("--amp", action="store_true")
@@ -472,6 +560,17 @@ def main():
             "--joint-frame-aux-weight replaces --phase-aux-weight and "
             "--cds-aux-weight; do not enable them together"
         )
+    if args.hmm_loss_weight < 0:
+        parser.error("--hmm-loss-weight must be non-negative")
+    if args.hmm_loss_weight <= 0 and (
+        args.selection_metric == "hmm" or args.hmm_init_checkpoint is not None
+    ):
+        parser.error(
+            "--selection-metric hmm and --hmm-init-checkpoint require "
+            "--hmm-loss-weight > 0"
+        )
+    if args.hmm_loss_weight > 0 and args.record_gradient_norms:
+        parser.error("--record-gradient-norms does not support --hmm-loss-weight")
     if args.all_splits_as_train and args.early_stopping_patience:
         parser.error("early stopping requires a held-out validation split")
     if args.stride != args.window_size // 2:
@@ -510,6 +609,7 @@ def main():
             require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
         val_data = test_data = None
     elif args.include_test_in_train:
@@ -518,11 +618,13 @@ def main():
             require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
         val_data = PUDataset(
             args.data_root / "val", require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
         test_data = None
     else:
@@ -530,16 +632,19 @@ def main():
             args.data_root / "train", require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
         val_data = PUDataset(
             args.data_root / "val", require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
         test_data = PUDataset(
             args.data_root / "test", require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
     generator = torch.Generator().manual_seed(SEED)
     loader_kwargs = dict(
@@ -566,6 +671,7 @@ def main():
             require_phase=require_phase,
             require_cds=require_cds,
             require_cds_boundary=args.cds_boundary_radius > 0,
+            require_path=args.hmm_loss_weight > 0,
         )
         for probe_index in range(len(probe_data)):
             candidate = probe_data[probe_index]
@@ -600,12 +706,35 @@ def main():
         phase_auxiliary=args.phase_aux_weight > 0,
         cds_auxiliary=args.cds_aux_weight > 0,
         joint_frame_auxiliary=args.joint_frame_aux_weight > 0,
+        gene_hmm=args.hmm_loss_weight > 0,
     ).to(device)
     model.gradient_checkpointing = args.gradient_checkpointing
     initialize_like_original(model)
+    if args.hmm_init_checkpoint is not None and not (
+        args.resume and (output_dir / "last_model.pt").exists()
+    ):
+        source = torch.load(
+            args.hmm_init_checkpoint, map_location="cpu", weights_only=False
+        )["model_state_dict"]
+        target = model.state_dict()
+        loaded = {
+            name: value for name, value in source.items()
+            if name in target and target[name].shape == value.shape
+        }
+        if "joint_frame_head.weight" in source:
+            # non_CDS/frame0-2 rows carry over; intron starts as non_CDS.
+            for suffix in ("weight", "bias"):
+                joint = source[f"joint_frame_head.{suffix}"]
+                loaded[f"state_head.{suffix}"] = torch.cat((joint, joint[:1]))
+        model.load_state_dict(loaded, strict=False)
+        logger.info(
+            f"hmm init from {args.hmm_init_checkpoint}: loaded={len(loaded)} "
+            f"skipped={len(source) - len(loaded)} "
+            f"missing={len(set(target) - set(loaded))}"
+        )
     excluded_from_shared = (
         "splice_head.", "start_stop_head.", "phase_head.", "cds_head.",
-        "joint_frame_head.", "frame_branch.",
+        "joint_frame_head.", "frame_branch.", "state_head.", "gene_hmm.",
     )
     shared_backbone_parameters = tuple(
         parameter for name, parameter in model.named_parameters()
@@ -616,7 +745,7 @@ def main():
     )
     decay, no_decay = [], []
     for name, parameter in model.named_parameters():
-        (no_decay if name.endswith(".bias") or "norm" in name.lower() or "embedding" in name.lower() else decay).append(parameter)
+        (no_decay if name.endswith(".bias") or "norm" in name.lower() or "embedding" in name.lower() or name.startswith("gene_hmm.") else decay).append(parameter)
     optimizer = torch.optim.AdamW(
         [{"params": decay, "weight_decay": 1e-4}, {"params": no_decay, "weight_decay": 0.0}],
         lr=args.lr, betas=(0.9, 0.95),
@@ -780,8 +909,9 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         totals = {
             "loss": 0.0, "splice": 0.0, "ss": 0.0,
-            "phase": 0.0, "cds": 0.0, "joint_frame": 0.0,
+            "phase": 0.0, "cds": 0.0, "joint_frame": 0.0, "hmm": 0.0,
         }
+        hmm_infeasible = 0
         accumulated = 0
         epoch_gradient_norms = None
         epoch_start = time.time()
@@ -807,11 +937,13 @@ def main():
                 if (
                     args.phase_aux_weight > 0 or args.cds_aux_weight > 0
                     or args.joint_frame_aux_weight > 0
+                    or args.hmm_loss_weight > 0
                 ):
                     outputs = model(
                         sequence, return_phase=args.phase_aux_weight > 0,
                         return_cds=args.cds_aux_weight > 0,
                         return_joint_frame=args.joint_frame_aux_weight > 0,
+                        return_states=args.hmm_loss_weight > 0,
                     )
                     splice_logits, ss_logits = outputs[:2]
                     output_index = 2
@@ -859,6 +991,14 @@ def main():
                     )
                 else:
                     joint_frame_loss = splice_logits.sum() * 0.0
+                if args.hmm_loss_weight > 0:
+                    hmm_loss, infeasible = gene_hmm_loss(
+                        model, sequence, splice_logits, ss_logits, outputs[-1],
+                        batch[-1].to(device, non_blocking=True),
+                    )
+                    hmm_infeasible += infeasible
+                else:
+                    hmm_loss = splice_logits.sum() * 0.0
                 splice_loss = candidate_loss(
                     splice_logits, splice_labels, sequence, "splice",
                     splice_ignore if use_ignore else None,
@@ -872,6 +1012,7 @@ def main():
                     + args.phase_aux_weight * phase_loss
                     + args.cds_aux_weight * cds_loss
                     + args.joint_frame_aux_weight * joint_frame_loss
+                    + args.hmm_loss_weight * hmm_loss
                 )
             if not torch.isfinite(loss):
                 logger.warning(
@@ -901,10 +1042,12 @@ def main():
             totals["phase"] += float(phase_loss.item())
             totals["cds"] += float(cds_loss.item())
             totals["joint_frame"] += float(joint_frame_loss.item())
+            totals["hmm"] += float(hmm_loss.item())
             if batch_index % 500 == 0:
                 logger.info(
                     f"epoch={epoch} batch={batch_index:,}/{len(train_loader):,} "
-                    f"loss={totals['loss']/batch_index:.5f} lr={lr:.2e}"
+                    f"loss={totals['loss']/batch_index:.5f} "
+                    f"hmm={totals['hmm']/batch_index:.5f} lr={lr:.2e}"
                 )
         if accumulated:
             if args.amp:
@@ -929,11 +1072,14 @@ def main():
                 args.cds_far_loss_weight,
                 args.joint_frame_aux_weight,
                 args.joint_noncoding_weight,
+                args.hmm_loss_weight,
             )
-        mean_ap = None if metrics is None else sum(
+        mean_ap_raw = None if metrics is None else sum(
             metrics[name]["AP"]
             for name in ("donor", "acceptor", "start", "stop")
         ) / 4
+        mean_ap_hmm = None if metrics is None else metrics.get("mean_AP_hmm")
+        mean_ap = mean_ap_hmm if args.selection_metric == "hmm" else mean_ap_raw
         row = {
             "epoch": epoch,
             "train_loss": totals["loss"] / len(train_loader),
@@ -967,6 +1113,27 @@ def main():
             "validation_joint_cds": (
                 None if metrics is None else metrics.get("joint_cds")
             ),
+            "train_hmm_loss": (
+                totals["hmm"] / len(train_loader)
+                if args.hmm_loss_weight > 0 else None
+            ),
+            "train_hmm_infeasible_windows": (
+                hmm_infeasible if args.hmm_loss_weight > 0 else None
+            ),
+            "validation_hmm_loss": (
+                None if validation_losses is None or args.hmm_loss_weight <= 0
+                else validation_losses["hmm_loss"]
+            ),
+            "validation_hmm_infeasible_windows": (
+                None if validation_losses is None or args.hmm_loss_weight <= 0
+                else validation_losses["hmm_infeasible_windows"]
+            ),
+            "validation_hmm": None if metrics is None else metrics.get("hmm"),
+            "validation_hmm_cds": (
+                None if metrics is None else metrics.get("hmm_cds")
+            ),
+            "mean_AP_raw": mean_ap_raw,
+            "mean_AP_hmm": mean_ap_hmm,
             "train_shared_backbone_gradient_norms": epoch_gradient_norms,
             "shared_backbone_parameter_count": shared_backbone_parameter_count,
             "gradient_probe_file": gradient_probe_file,
@@ -995,7 +1162,8 @@ def main():
             logger.info(
                 f"Epoch {epoch}: train loss={row['train_loss']:.5f}; "
                 f"validation loss={row['validation_loss']:.5f}; "
-                f"mean {args.reference_name} AP={mean_ap:.4f}\n    "
+                f"mean {args.reference_name} AP={mean_ap_raw:.4f} "
+                f"(selection {args.selection_metric}={mean_ap:.4f})\n    "
                 + format_metrics(metrics).replace("\n", "\n    ")
             )
             if "cds" in metrics:
@@ -1004,6 +1172,21 @@ def main():
                     f"    CDS AP={cds['AP']:.4f} F1={cds['F1']:.4f} "
                     f"P={cds['P']:.4f} R={cds['R']:.4f} "
                     f"thr={cds['threshold']:.4f}"
+                )
+            if "hmm" in metrics:
+                logger.info(
+                    f"    HMM posterior mean AP={metrics['mean_AP_hmm']:.4f} "
+                    f"(train hmm={row['train_hmm_loss']:.5f} "
+                    f"infeasible={hmm_infeasible}; validation "
+                    f"hmm={row['validation_hmm_loss']:.5f} infeasible="
+                    f"{row['validation_hmm_infeasible_windows']})\n        "
+                    + format_metrics(metrics["hmm"]).replace("\n", "\n        ")
+                )
+            if "hmm_cds" in metrics:
+                hmm_cds = metrics["hmm_cds"]
+                logger.info(
+                    f"    HMM CDS AP={hmm_cds['AP']:.4f} F1={hmm_cds['F1']:.4f} "
+                    f"P={hmm_cds['P']:.4f} R={hmm_cds['R']:.4f}"
                 )
             if "joint_cds" in metrics:
                 joint_cds = metrics["joint_cds"]
@@ -1026,6 +1209,10 @@ def main():
             "epochs_without_improvement": epochs_without_improvement,
             "config": vars(args) | {
                 "data_root": str(args.data_root), "output_dir": str(output_dir),
+                "hmm_init_checkpoint": (
+                    None if args.hmm_init_checkpoint is None
+                    else str(args.hmm_init_checkpoint)
+                ),
                 "d_model": 192, "d_state": 64, "n_layers": 8, "dropout": 0.1,
                 "regime": "chrxtrain" if args.include_test_in_train else "heldout",
             },
@@ -1067,6 +1254,7 @@ def main():
             args.cds_far_loss_weight,
             args.joint_frame_aux_weight,
             args.joint_noncoding_weight,
+            args.hmm_loss_weight,
         )
     result = {
         "mode": args.mode,

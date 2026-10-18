@@ -17,6 +17,10 @@ import time
 import numpy as np
 import pysam
 
+from .gene_paths import (
+    build_path_tracks, longest_cds_transcripts, parse_gff_transcripts,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs" / "droso_window_grid.json"
 EVIANN_GFF = ROOT / "data" / "raw" / "dmel_eviann_pseudo_label.gff"
@@ -317,10 +321,16 @@ def labels_for_window(start: int, strand: str, indexed, window: int):
 def generate_cell(
     output: Path, cell: dict, regions, eviann, reference,
     eviann_phase=None, reference_phase=None, cds_boundary_radius=0,
+    path_transcripts=None, path_ir_margin=None,
 ) -> dict:
     window, stride = int(cell["window_bp"]), int(cell["stride_bp"])
     summary = {}
+    path_stats = defaultdict(int)
     fasta = pysam.FastaFile(str(FASTA))
+    path_chosen = (
+        longest_cds_transcripts(path_transcripts)
+        if path_transcripts is not None else None
+    )
     for split, chrom_names in SPLITS.items():
         split_dir = output / split
         split_dir.mkdir(parents=True, exist_ok=True)
@@ -371,6 +381,15 @@ def generate_cell(
                         )
                         for strand in ("+", "-")
                     }
+            path_tracks = None
+            if path_transcripts is not None:
+                path_tracks, chrom_path_stats = build_path_tracks(
+                    lambda c, s, e: fasta.fetch(c, s, e).upper(),
+                    path_transcripts, path_chosen, chrom, chrom_len,
+                    path_ir_margin,
+                )
+                for key, value in chrom_path_stats.items():
+                    path_stats[key] += value
             count = 0
             for strand in ("+", "-"):
                 starts = window_starts(regions[chrom][strand], chrom_len, window, stride)
@@ -426,6 +445,9 @@ def generate_cell(
                                 cds_boundary_mask=e_cds_boundary,
                                 reference_cds_boundary_mask=r_cds_boundary,
                             )
+                    if path_tracks is not None:
+                        path = path_tracks[strand][start:start + window]
+                        arrays["path_labels"] = path if strand == "+" else path[::-1]
                     np.savez_compressed(split_dir / filename, **arrays)
                     count += 1
                     split_summary["windows"] += 1
@@ -465,6 +487,17 @@ def generate_cell(
             }
             if cds_boundary_radius else None
         ),
+        "path_labels": (
+            {
+                "definition": (
+                    "gene_hmm states IR/E0-E2/I0-I2 from the longest-CDS "
+                    "EviAnn transcript per gene; -1 unconstrained"
+                ),
+                "ir_margin_bp": path_ir_margin,
+                "stats": dict(path_stats),
+            }
+            if path_transcripts is not None else None
+        ),
         "owned_local_interval": [(window - stride) // 2, (window - stride) // 2 + stride],
         "splits": SPLITS, "accessions": CHROMS, "summary": summary,
         "sources": {
@@ -496,6 +529,17 @@ def main() -> None:
             "bases on each side of every CDS 0/1 transition; 0 disables."
         ),
     )
+    parser.add_argument(
+        "--include-path-labels", action="store_true",
+        help="Store longest-CDS gene-HMM state paths (path_labels) in every window.",
+    )
+    parser.add_argument(
+        "--path-ir-margin", type=int,
+        help=(
+            "Supervise IR only within this many bp of a chosen CDS span; "
+            "default supervises every non-gene base as IR."
+        ),
+    )
     args = parser.parse_args()
     if args.cds_boundary_radius < 0:
         parser.error("--cds-boundary-radius must be non-negative")
@@ -520,6 +564,10 @@ def main() -> None:
     e_index, r_index = index_sites(e_sites), index_sites(r_sites)
     e_phase = parse_cds_phase_records(EVIANN_GFF) if args.include_phase_labels else None
     r_phase = parse_cds_phase_records(REFERENCE_GTF) if args.include_phase_labels else None
+    path_transcripts = (
+        parse_gff_transcripts(EVIANN_GFF, set(CHROMS.values()))
+        if args.include_path_labels else None
+    )
     completed = []
     for cell in config["cells"]:
         cell_dir = args.output_root / cell["id"]
@@ -536,7 +584,8 @@ def main() -> None:
                 raise RuntimeError(f"refusing partial non-empty cell: {cell_dir}")
             manifest = generate_cell(
                 cell_dir, cell, regions, e_index, r_index, e_phase, r_phase,
-                args.cds_boundary_radius,
+                args.cds_boundary_radius, path_transcripts,
+                args.path_ir_margin,
             )
         completed.append({"cell": cell["id"], "manifest": str(manifest_path.resolve()), "windows": sum(manifest["summary"][s]["windows"] for s in SPLITS)})
     atomic_json(args.output_root / ".complete.json", {

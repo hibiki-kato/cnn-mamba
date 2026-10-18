@@ -327,6 +327,43 @@ UniAnn-only locus result (Sn 80.4, Pr 79.6, F1 80.00). The phase-only baseline
 remained narrowly best after combining EviAnn and UniAnn (F1 90.54 versus
 90.34 for the four-state 0.10 model).
 
+### End-to-end gene-HMM training
+
+`gene_hmm.py` adds a differentiable single-strand gene-structure CRF/HMM on
+top of the existing heads, in the spirit of Tiberius. States are
+IR/E0-E2/I0-I2 (codon position and phase-preserving introns). A new five-class
+state head (`non_CDS/frame0/frame1/frame2/intron`) gives state potentials;
+the donor/acceptor/start/stop heads give position-dependent transition
+potentials, gated by GT/AG/ATG/stop motifs, and an in-frame stop may only end
+the gene. The loss is the CRF negative log-likelihood of the label-constrained
+path set (`logZ - logZ_labels`, a sum over paths rather than a max), computed
+with a parallel log-semiring tree reduction (about 6 ms for 8 x 10 kb on an
+RTX 5070).
+
+Each gene is supervised along its longest-CDS EviAnn transcript. Transcripts
+the grammar cannot represent (non-canonical sites, split stop codons, partial
+CDS) and overlapping or abutting same-strand genes stay unconstrained (`-1`)
+over their CDS span. The candidate cross-entropy losses keep the union-of-
+isoform site labels.
+
+```bash
+cnn-mamba-prepare-droso --config configs/droso_frame_w10.json \
+  --output-root data/processed/gene_hmm --include-phase-labels --include-path-labels
+
+python -m cnn_mamba.train --data-root data/processed/gene_hmm/w10_frame \
+  --mode baseline --architecture cnn_mamba --cnn-kernel-size 7 \
+  --frame-dilation 3 --joint-frame-aux-weight 0.1 --joint-noncoding-weight 0.1 \
+  --hmm-loss-weight 1.0 --selection-metric hmm \
+  [--hmm-init-checkpoint /path/to/four_state/best_model.pt] ...
+```
+
+Validation reports raw-head AP alongside AP of the HMM posterior site
+marginals. `--hmm-init-checkpoint` fine-tunes from an existing model; a
+four-state joint-frame head seeds the state head. `score_hmm_chromosome` writes
+posterior site marginals (`--score-source hmm`) or the same checkpoint's raw
+head probabilities (`raw`) in the `score_chromosome` layout, so
+`export_uniann_scores` and `evaluate_candidates` work unchanged.
+
 ## 5. Run UniAnn and combined strict evaluation
 
 This deliberately uses the `chrxtrain` checkpoint, exports the six-column

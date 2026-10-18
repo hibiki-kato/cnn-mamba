@@ -51,6 +51,8 @@ def initialize_like_original(model):
         model.phase_head.apply(initialize)
     if getattr(model, "cds_head", None) is not None:
         model.cds_head.apply(initialize)
+    if getattr(model, "state_head", None) is not None:
+        model.state_head.apply(initialize)
 
 
 class BinnedPR:
