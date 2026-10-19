@@ -361,11 +361,11 @@ python -m cnn_mamba.train --data-root data/processed/gene_hmm/w10_frame \
   --mode baseline --architecture cnn_mamba --cnn-kernel-size 7 \
   --frame-dilation 3 --joint-frame-aux-weight 0.1 --joint-noncoding-weight 0.1 \
   --hmm-loss-weight 1.0 --selection-metric hmm \
-  [--hmm-init-checkpoint /path/to/four_state/best_model.pt] ...
+  [--init-checkpoint /path/to/four_state/best_model.pt] ...
 ```
 
 Validation reports raw-head AP alongside AP of the HMM posterior site
-marginals. `--hmm-init-checkpoint` fine-tunes from an existing model; a
+marginals. `--init-checkpoint` fine-tunes from an existing model; a
 four-state joint-frame head seeds the state head. `score_hmm_chromosome` writes
 posterior site marginals (`--score-source hmm`) or the same checkpoint's raw
 head probabilities (`raw`) in the `score_chromosome` layout, so

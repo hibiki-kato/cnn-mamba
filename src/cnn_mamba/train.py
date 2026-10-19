@@ -491,10 +491,12 @@ def main():
         ),
     )
     parser.add_argument(
-        "--hmm-init-checkpoint", type=Path,
+        "--init-checkpoint", "--hmm-init-checkpoint", dest="init_checkpoint",
+        type=Path,
         help=(
-            "Initialise matching parameters from this checkpoint before "
-            "training; a joint-frame head seeds the HMM state head."
+            "Initialise shape-matching parameters from this checkpoint before "
+            "training; with --hmm-loss-weight a joint-frame head also seeds "
+            "the HMM state head."
         ),
     )
     parser.add_argument(
@@ -571,13 +573,8 @@ def main():
         )
     if args.hmm_loss_weight < 0:
         parser.error("--hmm-loss-weight must be non-negative")
-    if args.hmm_loss_weight <= 0 and (
-        args.selection_metric == "hmm" or args.hmm_init_checkpoint is not None
-    ):
-        parser.error(
-            "--selection-metric hmm and --hmm-init-checkpoint require "
-            "--hmm-loss-weight > 0"
-        )
+    if args.hmm_loss_weight <= 0 and args.selection_metric == "hmm":
+        parser.error("--selection-metric hmm requires --hmm-loss-weight > 0")
     if args.hmm_loss_weight > 0 and args.record_gradient_norms:
         parser.error("--record-gradient-norms does not support --hmm-loss-weight")
     if args.all_splits_as_train and args.early_stopping_patience:
@@ -719,25 +716,25 @@ def main():
     ).to(device)
     model.gradient_checkpointing = args.gradient_checkpointing
     initialize_like_original(model)
-    if args.hmm_init_checkpoint is not None and not (
+    if args.init_checkpoint is not None and not (
         args.resume and (output_dir / "last_model.pt").exists()
     ):
         source = torch.load(
-            args.hmm_init_checkpoint, map_location="cpu", weights_only=False
+            args.init_checkpoint, map_location="cpu", weights_only=False
         )["model_state_dict"]
         target = model.state_dict()
         loaded = {
             name: value for name, value in source.items()
             if name in target and target[name].shape == value.shape
         }
-        if "joint_frame_head.weight" in source:
+        if "joint_frame_head.weight" in source and "state_head.weight" in target:
             # non_CDS/frame0-2 rows carry over; intron starts as non_CDS.
             for suffix in ("weight", "bias"):
                 joint = source[f"joint_frame_head.{suffix}"]
                 loaded[f"state_head.{suffix}"] = torch.cat((joint, joint[:1]))
         model.load_state_dict(loaded, strict=False)
         logger.info(
-            f"hmm init from {args.hmm_init_checkpoint}: loaded={len(loaded)} "
+            f"init from {args.init_checkpoint}: loaded={len(loaded)} "
             f"skipped={len(source) - len(loaded)} "
             f"missing={len(set(target) - set(loaded))}"
         )
@@ -1218,9 +1215,9 @@ def main():
             "epochs_without_improvement": epochs_without_improvement,
             "config": vars(args) | {
                 "data_root": str(args.data_root), "output_dir": str(output_dir),
-                "hmm_init_checkpoint": (
-                    None if args.hmm_init_checkpoint is None
-                    else str(args.hmm_init_checkpoint)
+                "init_checkpoint": (
+                    None if args.init_checkpoint is None
+                    else str(args.init_checkpoint)
                 ),
                 "d_model": 192, "d_state": 64, "n_layers": 8, "dropout": 0.1,
                 "regime": "chrxtrain" if args.include_test_in_train else "heldout",
