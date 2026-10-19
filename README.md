@@ -346,6 +346,13 @@ CDS) and overlapping or abutting same-strand genes stay unconstrained (`-1`)
 over their CDS span. The candidate cross-entropy losses keep the union-of-
 isoform site labels.
 
+`--path-isoforms all` instead supervises every CDS isoform of a gene
+(`path_masks`): each base allows the union of its isoforms' states, and
+start/stop/donor/acceptor transitions are allowed only where some isoform
+uses them. The constrained path set is then the splice graph of the annotated
+isoforms, so alternative splicing is not penalised. Genes with any
+unrepresentable isoform are left unconstrained. `train` reads either format.
+
 ```bash
 cnn-mamba-prepare-droso --config configs/droso_frame_w10.json \
   --output-root data/processed/gene_hmm --include-phase-labels --include-path-labels

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
+from .gene_hmm import labels_to_masks
 from .model import SpliceMamba
 from .common import (
     BinnedPR,
@@ -115,14 +116,20 @@ class PUDataset(Dataset):
                     )
             if self.require_path:
                 # Always last so the historical positional layout is unchanged.
-                if "path_labels" not in data:
+                # Longest-CDS labels and all-isoform masks both become masks.
+                if "path_masks" in data:
+                    arrays.append(torch.from_numpy(
+                        data["path_masks"].astype(np.int64, copy=False)
+                    ))
+                elif "path_labels" in data:
+                    arrays.append(labels_to_masks(torch.from_numpy(
+                        data["path_labels"].astype(np.int64, copy=False)
+                    )))
+                else:
                     raise KeyError(
-                        f"missing path array 'path_labels' in {self.files[index]}; "
-                        "regenerate with --include-path-labels"
+                        f"missing path array 'path_labels' or 'path_masks' in "
+                        f"{self.files[index]}; regenerate with --include-path-labels"
                     )
-                arrays.append(torch.from_numpy(
-                    data["path_labels"].astype(np.int64, copy=False)
-                ))
             return tuple(arrays)
 
 
@@ -193,10 +200,10 @@ def boundary_weighted_cds_loss(logits, labels, boundary_mask, far_weight=0.1):
     return loss
 
 
-def gene_hmm_loss(model, sequence, splice_logits, ss_logits, state_logits, path_labels):
+def gene_hmm_loss(model, sequence, splice_logits, ss_logits, state_logits, path_masks):
     """Mean per-base CRF NLL over windows whose labels admit a path."""
     nll, feasible = model.gene_hmm(
-        sequence, splice_logits, ss_logits, state_logits, path_labels
+        sequence, splice_logits, ss_logits, state_logits, path_masks=path_masks
     )
     if not feasible.any():
         return splice_logits.sum() * 0.0, int((~feasible).sum().item())
@@ -478,7 +485,9 @@ def main():
         "--hmm-loss-weight", type=float, default=0.0,
         help=(
             "Weight of the gene-HMM CRF negative log-likelihood (per base) on "
-            "longest-CDS path labels; adds a five-class state head."
+            "the window path supervision (longest-CDS labels or all-isoform "
+            "masks, see prepare_droso --path-isoforms); adds a five-class "
+            "state head."
         ),
     )
     parser.add_argument(

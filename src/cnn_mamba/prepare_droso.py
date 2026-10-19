@@ -18,7 +18,8 @@ import numpy as np
 import pysam
 
 from .gene_paths import (
-    build_path_tracks, longest_cds_transcripts, parse_gff_transcripts,
+    build_isoform_mask_tracks, build_path_tracks, longest_cds_transcripts,
+    parse_gff_transcripts,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -321,7 +322,7 @@ def labels_for_window(start: int, strand: str, indexed, window: int):
 def generate_cell(
     output: Path, cell: dict, regions, eviann, reference,
     eviann_phase=None, reference_phase=None, cds_boundary_radius=0,
-    path_transcripts=None, path_ir_margin=None,
+    path_transcripts=None, path_ir_margin=None, path_isoforms="longest",
 ) -> dict:
     window, stride = int(cell["window_bp"]), int(cell["stride_bp"])
     summary = {}
@@ -329,8 +330,9 @@ def generate_cell(
     fasta = pysam.FastaFile(str(FASTA))
     path_chosen = (
         longest_cds_transcripts(path_transcripts)
-        if path_transcripts is not None else None
+        if path_transcripts is not None and path_isoforms == "longest" else None
     )
+    path_key = "path_masks" if path_isoforms == "all" else "path_labels"
     for split, chrom_names in SPLITS.items():
         split_dir = output / split
         split_dir.mkdir(parents=True, exist_ok=True)
@@ -383,11 +385,16 @@ def generate_cell(
                     }
             path_tracks = None
             if path_transcripts is not None:
-                path_tracks, chrom_path_stats = build_path_tracks(
-                    lambda c, s, e: fasta.fetch(c, s, e).upper(),
-                    path_transcripts, path_chosen, chrom, chrom_len,
-                    path_ir_margin,
-                )
+                fetch = lambda c, s, e: fasta.fetch(c, s, e).upper()
+                if path_isoforms == "all":
+                    path_tracks, chrom_path_stats = build_isoform_mask_tracks(
+                        fetch, path_transcripts, chrom, chrom_len, path_ir_margin,
+                    )
+                else:
+                    path_tracks, chrom_path_stats = build_path_tracks(
+                        fetch, path_transcripts, path_chosen, chrom, chrom_len,
+                        path_ir_margin,
+                    )
                 for key, value in chrom_path_stats.items():
                     path_stats[key] += value
             count = 0
@@ -447,7 +454,7 @@ def generate_cell(
                             )
                     if path_tracks is not None:
                         path = path_tracks[strand][start:start + window]
-                        arrays["path_labels"] = path if strand == "+" else path[::-1]
+                        arrays[path_key] = path if strand == "+" else path[::-1]
                     np.savez_compressed(split_dir / filename, **arrays)
                     count += 1
                     split_summary["windows"] += 1
@@ -489,7 +496,12 @@ def generate_cell(
         ),
         "path_labels": (
             {
+                "array": path_key,
+                "isoforms": path_isoforms,
                 "definition": (
+                    "gene_hmm allowed-set masks (bits 0-6 states, 8-11 events) "
+                    "for the splice graph of every CDS isoform per EviAnn gene"
+                    if path_isoforms == "all" else
                     "gene_hmm states IR/E0-E2/I0-I2 from the longest-CDS "
                     "EviAnn transcript per gene; -1 unconstrained"
                 ),
@@ -531,7 +543,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--include-path-labels", action="store_true",
-        help="Store longest-CDS gene-HMM state paths (path_labels) in every window.",
+        help="Store gene-HMM path supervision (see --path-isoforms) in every window.",
+    )
+    parser.add_argument(
+        "--path-isoforms", choices=("longest", "all"), default="longest",
+        help=(
+            "longest: one longest-CDS path per gene (path_labels); all: "
+            "allowed-set masks over every CDS isoform (path_masks)."
+        ),
     )
     parser.add_argument(
         "--path-ir-margin", type=int,
@@ -585,7 +604,7 @@ def main() -> None:
             manifest = generate_cell(
                 cell_dir, cell, regions, e_index, r_index, e_phase, r_phase,
                 args.cds_boundary_radius, path_transcripts,
-                args.path_ir_margin,
+                args.path_ir_margin, args.path_isoforms,
             )
         completed.append({"cell": cell["id"], "manifest": str(manifest_path.resolve()), "windows": sum(manifest["summary"][s]["windows"] for s in SPLITS)})
     atomic_json(args.output_root / ".complete.json", {

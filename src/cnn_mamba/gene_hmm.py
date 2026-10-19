@@ -24,6 +24,11 @@ like a contiguous stop because the intron-side bases are A/G of ``AG``.
 The loss is the CRF negative log-likelihood of the label-constrained path set,
 ``logZ - logZ_constrained``: a sum over paths, not a max. Unconstrained bases
 (label -1) allow every state, so the constrained term marginalises over them.
+Supervision can also be an allowed-set mask (``path_masks``): per base, the
+allowed states and the allowed boundary events on the transition into it. A
+single-path label is the special case of one state with every event allowed;
+the union of several isoforms with events restricted to annotated positions
+constrains to the splice graph of those isoforms.
 The partition function uses a parallel tree reduction in the log semiring.
 """
 
@@ -44,6 +49,18 @@ INFEASIBLE = 0.5 * NEG
 BOUNDARIES = ("start", "stop", "donor", "acceptor")
 # Longest motif look-behind (stop, t-3) / look-ahead (start, t+2).
 EDGE_RELAX = 3
+# Transitions that are boundary events, keyed like ``BOUNDARIES``.
+BOUNDARY_EDGES = {
+    "start": ((IR, E0),),
+    "stop": ((E2, IR),),
+    "donor": ((E0, I1), (E1, I2), (E2, I0)),
+    "acceptor": ((I0, E0), (I1, E1), (I2, E2)),
+}
+# Allowed-set mask encoding: bits 0-6 states, bits 8-11 events (BOUNDARIES order).
+EVENT_SHIFT = 8
+ALL_STATES = (1 << N_STATES) - 1
+ALL_EVENTS = (1 << len(BOUNDARIES)) - 1
+UNCONSTRAINED = ALL_STATES | ALL_EVENTS << EVENT_SHIFT
 
 
 def sequence_masks(sequence):
@@ -132,6 +149,34 @@ def label_mask(path_labels, dtype):
     )
 
 
+def labels_to_masks(path_labels):
+    """Allowed-set masks equivalent to single-path labels (-1 unconstrained)."""
+    labels = path_labels.long()
+    states = torch.where(
+        labels < 0, ALL_STATES,
+        torch.bitwise_left_shift(torch.ones_like(labels), labels.clamp(min=0)),
+    )
+    return states | ALL_EVENTS << EVENT_SHIFT
+
+
+def mask_potentials(path_masks, dtype):
+    """Additive ``[B, L, S]`` state and ``[B, L, S, S]`` transition masks."""
+    masks = path_masks.long()
+    device = masks.device
+    zero = torch.zeros((), dtype=dtype, device=device)
+    neg = torch.tensor(NEG, dtype=dtype, device=device)
+    bits = torch.arange(N_STATES, device=device)
+    state = torch.where(((masks.unsqueeze(-1) >> bits) & 1).bool(), zero, neg)
+    transition = torch.zeros(
+        masks.shape + (N_STATES, N_STATES), dtype=dtype, device=device
+    )
+    for index, name in enumerate(BOUNDARIES):
+        blocked = ((masks >> (EVENT_SHIFT + index)) & 1) == 0
+        for source, target in BOUNDARY_EDGES[name]:
+            transition[..., source, target] = torch.where(blocked, neg, zero)
+    return state, transition
+
+
 def viterbi(emission, transition):
     """Sequential max-product decoding; returns ``[B, L]`` state indices."""
     batch, length, _ = emission.shape
@@ -177,10 +222,11 @@ class GeneHMM(nn.Module):
 
     def forward(
         self, sequence, splice_logits, start_stop_logits, state_logits,
-        path_labels,
+        path_labels=None, path_masks=None,
     ):
         """Per-window NLL / length and a feasibility mask.
 
+        Supervision is either ``path_labels`` or allowed-set ``path_masks``.
         Labels on the ``EDGE_RELAX`` bases at each window end are ignored:
         motifs there are cut by the window, so their transitions cannot be
         checked. Windows whose labels still admit no path are returned with
@@ -193,11 +239,18 @@ class GeneHMM(nn.Module):
             )
             transition = transition_potentials(sequence, boundary)
             log_z = log_partition(emission, transition)
-            path_labels = path_labels.clone()
-            path_labels[:, :EDGE_RELAX] = -1
-            path_labels[:, -EDGE_RELAX:] = -1
-            constrained = emission + label_mask(path_labels, emission.dtype)
-            log_z_labels = log_partition(constrained, transition)
+            if (path_labels is None) == (path_masks is None):
+                raise ValueError("pass exactly one of path_labels or path_masks")
+            masks = (
+                labels_to_masks(path_labels) if path_masks is None
+                else path_masks.long().clone()
+            )
+            masks[:, :EDGE_RELAX] = UNCONSTRAINED
+            masks[:, -EDGE_RELAX:] = UNCONSTRAINED
+            state_mask, transition_mask = mask_potentials(masks, emission.dtype)
+            log_z_labels = log_partition(
+                emission + state_mask, transition + transition_mask
+            )
             feasible = log_z_labels > INFEASIBLE
             nll = (log_z - log_z_labels) / sequence.shape[1]
             nll = torch.where(feasible, nll, torch.zeros_like(nll))
