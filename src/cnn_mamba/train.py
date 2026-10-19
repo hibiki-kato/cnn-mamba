@@ -727,6 +727,7 @@ def main():
             name: value for name, value in source.items()
             if name in target and target[name].shape == value.shape
         }
+        matched = len(loaded)
         if "joint_frame_head.weight" in source and "state_head.weight" in target:
             # non_CDS/frame0-2 rows carry over; intron starts as non_CDS.
             for suffix in ("weight", "bias"):
@@ -735,7 +736,7 @@ def main():
         model.load_state_dict(loaded, strict=False)
         logger.info(
             f"init from {args.init_checkpoint}: loaded={len(loaded)} "
-            f"skipped={len(source) - len(loaded)} "
+            f"skipped={len(source) - matched} "
             f"missing={len(set(target) - set(loaded))}"
         )
     excluded_from_shared = (
