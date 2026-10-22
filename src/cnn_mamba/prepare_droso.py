@@ -531,6 +531,13 @@ def main() -> None:
     parser.add_argument("--reference-gtf", type=Path, default=REFERENCE_GTF)
     parser.add_argument("--output-root", type=Path, default=ROOT / "data" / "processed")
     parser.add_argument(
+        "--chromosomes", type=Path,
+        help=(
+            'JSON {"splits": {"train"|"val"|"test": [names]}, "accessions": '
+            '{name: FASTA/GFF accession}} replacing the Dmel chromosome split.'
+        ),
+    )
+    parser.add_argument(
         "--include-phase-labels", action="store_true",
         help="Store masked EviAnn and reference CDS phase targets in every window.",
     )
@@ -571,6 +578,15 @@ def main() -> None:
     for path in (CONFIG, FASTA, EVIANN_GFF, REFERENCE_GTF):
         if not path.is_file():
             parser.error(f"required input does not exist: {path}")
+    if args.chromosomes is not None:
+        spec = json.loads(args.chromosomes.read_text())
+        if set(spec["splits"]) != set(SPLITS):
+            parser.error(f"--chromosomes splits must be {sorted(SPLITS)}")
+        missing = {n for names in spec["splits"].values() for n in names} - set(spec["accessions"])
+        if missing:
+            parser.error(f"--chromosomes names without an accession: {sorted(missing)}")
+        SPLITS.clear(); SPLITS.update(spec["splits"])
+        CHROMS.clear(); CHROMS.update(spec["accessions"])
     config = json.loads(CONFIG.read_text())
     args.output_root.mkdir(parents=True, exist_ok=True)
     started = time.time()

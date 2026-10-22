@@ -102,6 +102,8 @@ def reference_sites(species, reference_gtf, fasta_path, chrom_key):
         from . import prepare_droso
 
         prepare_droso.FASTA = Path(fasta_path).resolve()
+        if chrom_key not in prepare_droso.CHROMS.values():  # non-Dmel test chromosome
+            prepare_droso.CHROMS[chrom_key] = chrom_key
         meta, exons, cds, explicit = prepare_droso.parse_reference(Path(reference_gtf))
         sites, rejected = prepare_droso.extract_sites(meta, exons, cds, explicit)
     reference = str(Path(reference_gtf).resolve())
