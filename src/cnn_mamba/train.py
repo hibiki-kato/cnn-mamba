@@ -422,6 +422,11 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--train-only-hmm", action="store_true",
+        help="Freeze everything but the state head and gene HMM (post-hoc HMM on an --init-checkpoint).",
+    )
     parser.add_argument(
         "--splice-loss-weight", type=float, default=0.25,
         help="Weight applied to splice loss; start/stop loss has weight 1.0.",
@@ -433,6 +438,18 @@ def main():
             "validation mean-AP improvement; 0 disables early stopping."
         ),
     )
+    parser.add_argument(
+        "--lr-schedule", choices=("cosine", "plateau"), default="cosine",
+        help=(
+            "cosine: warmup then cosine decay to 0.1x over --epochs. plateau: warmup "
+            "then constant LR, multiplied by --plateau-factor after --plateau-patience "
+            "epochs without validation improvement, down to --min-lr-ratio x --lr; "
+            "early stopping then counts only epochs spent at that floor."
+        ),
+    )
+    parser.add_argument("--plateau-patience", type=int, default=1)
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument(
         "--early-stopping-min-delta", type=float, default=0.0,
         help="Minimum validation mean-AP increase that resets early stopping.",
@@ -548,6 +565,8 @@ def main():
         parser.error("--early-stopping-patience must be non-negative")
     if args.early_stopping_min_delta < 0:
         parser.error("--early-stopping-min-delta must be non-negative")
+    if args.plateau_patience < 1 or not 0 < args.plateau_factor < 1 or not 0 < args.min_lr_ratio <= 1:
+        parser.error("--plateau-patience >= 1, 0 < --plateau-factor < 1 and 0 < --min-lr-ratio <= 1 required")
     if args.frame_dilation < 0:
         parser.error("--frame-dilation must be non-negative")
     if args.phase_aux_weight < 0:
@@ -575,6 +594,8 @@ def main():
         parser.error("--hmm-loss-weight must be non-negative")
     if args.hmm_loss_weight <= 0 and args.selection_metric == "hmm":
         parser.error("--selection-metric hmm requires --hmm-loss-weight > 0")
+    if args.train_only_hmm and (args.hmm_loss_weight <= 0 or args.init_checkpoint is None):
+        parser.error("--train-only-hmm requires --hmm-loss-weight > 0 and --init-checkpoint")
     if args.hmm_loss_weight > 0 and args.record_gradient_norms:
         parser.error("--record-gradient-norms does not support --hmm-loss-weight")
     if args.all_splits_as_train and args.early_stopping_patience:
@@ -586,8 +607,8 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required")
 
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda")
     output_dir = (args.output_dir or (
         ROOT / f"checkpoints_hsap_eviann_pu_pilot_{args.mode}"
@@ -652,7 +673,7 @@ def main():
             require_cds_boundary=args.cds_boundary_radius > 0,
             require_path=args.hmm_loss_weight > 0,
         )
-    generator = torch.Generator().manual_seed(SEED)
+    generator = torch.Generator().manual_seed(args.seed)
     loader_kwargs = dict(
         num_workers=args.workers,
         pin_memory=True,
@@ -739,6 +760,9 @@ def main():
             f"skipped={len(source) - matched} "
             f"missing={len(set(target) - set(loaded))}"
         )
+    if args.train_only_hmm:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith(("state_head.", "gene_hmm.")))
     excluded_from_shared = (
         "splice_head.", "start_stop_head.", "phase_head.", "cds_head.",
         "joint_frame_head.", "frame_branch.", "state_head.", "gene_hmm.",
@@ -752,6 +776,8 @@ def main():
     )
     decay, no_decay = [], []
     for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
         (no_decay if name.endswith(".bias") or "norm" in name.lower() or "embedding" in name.lower() or name.startswith("gene_hmm.") else decay).append(parameter)
     optimizer = torch.optim.AdamW(
         [{"params": decay, "weight_decay": 1e-4}, {"params": no_decay, "weight_decay": 0.0}],
@@ -762,9 +788,14 @@ def main():
     total_steps = args.epochs * steps_per_epoch
     warmup = max(20, min(200, total_steps // 10))
 
+    # Plateau state: LR multiplier and non-improving epochs since the last cut.
+    plateau = {"scale": 1.0, "bad": 0}
+
     def scheduled_lr(step):
         if step < warmup:
             return args.lr * (step + 1) / warmup
+        if args.lr_schedule == "plateau":
+            return args.lr * plateau["scale"]
         progress = (step - warmup) / max(total_steps - warmup, 1)
         return args.lr * (0.1 + 0.45 * (1 + math.cos(math.pi * progress)))
 
@@ -788,6 +819,7 @@ def main():
             )
         )
         epochs_without_improvement = int(saved.get("epochs_without_improvement", 0))
+        plateau.update(saved.get("plateau", {}))
         optimizer_step = int(saved.get("optimizer_step", saved["epoch"] * steps_per_epoch))
         start_epoch = int(saved["epoch"]) + 1
 
@@ -814,8 +846,8 @@ def main():
             else torch.cuda.current_device()
         )
         with torch.random.fork_rng(devices=[cuda_device_index]):
-            torch.manual_seed(SEED + epoch)
-            torch.cuda.manual_seed_all(SEED + epoch)
+            torch.manual_seed(args.seed + epoch)
+            torch.cuda.manual_seed_all(args.seed + epoch)
             probe_batch = tuple(
                 tensor.unsqueeze(0).to(device, non_blocking=True)
                 for tensor in gradient_probe
@@ -899,11 +931,15 @@ def main():
                 }
         return norms
 
+    def patience_exhausted():
+        if args.early_stopping_patience <= 0:
+            return False
+        if args.lr_schedule == "plateau":
+            return plateau["scale"] <= args.min_lr_ratio and plateau["bad"] >= args.early_stopping_patience
+        return epochs_without_improvement >= args.early_stopping_patience
+
     run_start = time.time()
-    early_stopped = (
-        args.early_stopping_patience > 0
-        and epochs_without_improvement >= args.early_stopping_patience
-    )
+    early_stopped = patience_exhausted()
     stopped_epoch = int(history[-1]["epoch"]) if early_stopped else None
     if early_stopped:
         logger.info(
@@ -1160,6 +1196,12 @@ def main():
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
+            if args.lr_schedule == "plateau":
+                plateau["bad"] = 0 if improved else plateau["bad"] + 1
+                if plateau["scale"] > args.min_lr_ratio and plateau["bad"] >= args.plateau_patience:
+                    plateau["scale"] = max(args.min_lr_ratio, plateau["scale"] * args.plateau_factor)
+                    plateau["bad"] = 0
+                    logger.info(f"Plateau: LR -> {args.lr * plateau['scale']:.3g} after epoch {epoch}")
         if metrics is None:
             logger.info(
                 f"Epoch {epoch}: train loss={row['train_loss']:.5f}; "
@@ -1214,6 +1256,7 @@ def main():
             "mean_AP": mean_ap,
             "best_validation_mean_AP": None if metrics is None else best_score,
             "epochs_without_improvement": epochs_without_improvement,
+            "plateau": dict(plateau),
             "config": vars(args) | {
                 "data_root": str(args.data_root), "output_dir": str(output_dir),
                 "init_checkpoint": (
@@ -1231,11 +1274,7 @@ def main():
         torch.save(checkpoint, epoch_dir / f"epoch_{epoch:0{epoch_width}d}.pt")
         if improved:
             torch.save(checkpoint, output_dir / "best_model.pt")
-        if (
-            metrics is not None
-            and args.early_stopping_patience > 0
-            and epochs_without_improvement >= args.early_stopping_patience
-        ):
+        if metrics is not None and patience_exhausted():
             early_stopped = True
             stopped_epoch = epoch
             logger.info(
@@ -1273,6 +1312,7 @@ def main():
         "early_stopped": early_stopped,
         "stopped_epoch": stopped_epoch,
         "epochs_without_improvement": epochs_without_improvement,
+        "plateau": dict(plateau),
         "elapsed_seconds": time.time() - run_start,
     }
     (output_dir / "results.json").write_text(json.dumps(result, indent=2) + "\n")
