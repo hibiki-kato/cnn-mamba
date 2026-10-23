@@ -74,9 +74,19 @@ OMP_NUM_THREADS=1 cnn-mamba-score \
 `--device auto` (the default) selects CUDA, then Apple MPS, then CPU. Use
 `--device cpu` on Mac for the CPU path or `--device mps` for Apple GPU
 execution. The phase, joint-frame and gated-phase scoring modules accept
-the same option. CPU and MPS default to batch size 1; `--batch-size` overrides
-it. On HPC, set `OMP_NUM_THREADS` to the CPU allocation and benchmark the
+the same option. CPU defaults to batch size 1; CUDA and MPS calculate a batch
+once at startup from hardware memory capacity and model/window dimensions.
+`--batch-size 4` overrides it, and `--batch-size auto` also enables the capacity
+calculation on CPU. On HPC, set `OMP_NUM_THREADS` to the CPU allocation and benchmark the
 thread count; more threads need not improve small matrix operations.
+
+Batch selection uses total CUDA VRAM, CPU RAM, or the Mac's shared RAM capped
+by Metal's recommended working-set capacity. It performs no live memory
+monitoring, trial forwards, or runtime batch resizing. `--memory-fraction`
+(default `0.5`) sets the fraction of that capacity used in the estimate;
+`--max-batch-size` (default `32`) caps the result. For a fixed HPC allocation,
+`--memory-gb 8` supplies an 8 GiB capacity directly, without querying hardware.
+The estimate is conservative, not a guarantee of peak memory or optimal speed.
 
 ### Shared model and checkpoint interface
 

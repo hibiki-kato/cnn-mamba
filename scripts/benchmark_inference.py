@@ -13,19 +13,22 @@ import time
 
 import torch
 
-from cnn_mamba.inference import add_device_argument, resolve_device
+from cnn_mamba.inference import (
+    add_batch_arguments, add_device_argument, hardware_memory,
+    configure_batch_size, resolve_device,
+)
 from cnn_mamba.model import model_from_checkpoint
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=1)
+    add_batch_arguments(parser, default=1)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     add_device_argument(parser)
     args = parser.parse_args()
-    if min(args.batch_size, args.threads, args.repeats) < 1:
+    if min(args.threads, args.repeats) < 1:
         parser.error("batch size, threads and repeats must be positive")
     torch.set_num_threads(args.threads)
     torch.manual_seed(42)
@@ -33,6 +36,9 @@ def main():
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = model_from_checkpoint(saved, device).eval()
     length = int(saved["config"]["window_size"])
+    memory_capacity = hardware_memory(device) if args.memory_gb is None else args.memory_gb * 1024**3
+    requested_batch = args.batch_size
+    args.batch_size = configure_batch_size(args, model, length, device)
     sequence = torch.randint(0, 5, (args.batch_size, length)).to(device)
     extra_outputs = dict(
         return_phase=model.phase_head is not None,
@@ -66,6 +72,9 @@ def main():
         "torch": torch.__version__, "python": platform.python_version(),
         "platform": platform.platform(), "device": str(device), "backend": model.backend,
         "threads": args.threads, "batch_size": args.batch_size,
+        "requested_batch_size": requested_batch,
+        "memory_fraction": args.memory_fraction,
+        "memory_capacity_bytes": memory_capacity,
         "window_size": length, "stride": saved["config"].get("stride"),
         "parameters": sum(p.numel() for p in model.parameters()),
         "seconds_per_batch": timings, "median_seconds_per_batch": statistics.median(timings),

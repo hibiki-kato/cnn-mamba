@@ -13,7 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_device_argument, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, resolve_device
 from .score_chromosome import encode, keep_bounds
 
 
@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--chrom", required=True)
     parser.add_argument("--display-chrom", default="chrX")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int)
+    add_batch_arguments(parser)
     add_device_argument(parser)
     parser.add_argument(
         "--dtype", choices=("float16", "float32"), default="float32",
@@ -37,9 +37,6 @@ def main():
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
-    if args.batch_size is not None and args.batch_size < 1:
-        parser.error("batch size must be positive")
-    args.batch_size = args.batch_size or (8 if device.type == "cuda" else 1)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
@@ -65,6 +62,7 @@ def main():
     )
 
     model = model_from_checkpoint(checkpoint, device).eval()
+    args.batch_size = configure_batch_size(args, model, window, device)
     print(f"device={device} backend=torch batch_size={args.batch_size}", flush=True)
     started = time.time()
     expected_position = 0

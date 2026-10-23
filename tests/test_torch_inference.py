@@ -187,6 +187,20 @@ assert "mamba_ssm" not in sys.modules
                         self.assertEqual(positions.tolist(), expected)
                     else:
                         self.assertEqual(values.shape[0], len(text))
+                    auto_destination = root / (name + "_auto")
+                    auto_argv = argv.copy()
+                    auto_argv[auto_argv.index("--output-dir") + 1] = str(auto_destination)
+                    auto_argv += ["--batch-size", "auto", "--memory-gb", "0.5", "--max-batch-size", "2"]
+                    with patch.object(sys, "argv", auto_argv):
+                        module.main()
+                    auto_metadata = json.loads((auto_destination / "metadata.json").read_text())
+                    self.assertEqual(auto_metadata["batch_size"], 2)
+                    for path in destination.glob("*.npy"):
+                        before, after = np.load(path), np.load(auto_destination / path.name)
+                        if np.issubdtype(before.dtype, np.floating):
+                            np.testing.assert_allclose(after, before, rtol=2e-5, atol=2e-6)
+                        else:
+                            np.testing.assert_array_equal(after, before)
 
     @unittest.skipUnless(importlib.util.find_spec("mamba_ssm"), "optional Mamba3 training package absent")
     def test_upstream_state_dict_loads_strictly_in_both_directions(self):
