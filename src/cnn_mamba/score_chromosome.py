@@ -16,6 +16,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
+from .inference import add_device_argument, resolve_device
 
 ENCODE = np.full(256, 4, dtype=np.uint8)
 for _base, _value in (("A", 0), ("C", 1), ("G", 2), ("T", 3)):
@@ -87,19 +88,23 @@ def main() -> None:
     parser.add_argument("--chrom", required=True, help="FASTA accession/sequence name")
     parser.add_argument("--display-chrom", default="chrX")
     parser.add_argument("--batch-size", type=int)
+    add_device_argument(parser)
     args = parser.parse_args()
     if (args.output_dir / ".complete.json").is_file():
         print(f"already complete: {args.output_dir}", flush=True)
         return
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required")
+    device = resolve_device(args.device)
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("batch size must be positive")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     window = int(checkpoint["config"]["window_size"])
     stride = int(checkpoint["config"]["stride"])
-    batch_size = args.batch_size or ({5000: 8, 10000: 4, 20000: 2}.get(window, 1))
+    batch_size = args.batch_size or (
+        {5000: 8, 10000: 4, 20000: 2}.get(window, 1) if device.type == "cuda" else 1
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda")
     model = model_from_checkpoint(checkpoint, device).eval()
+    print(f"device={device} backend=torch batch_size={batch_size}", flush=True)
     fasta = pysam.FastaFile(str(args.fasta))
     chrom_len = fasta.get_reference_length(args.chrom)
     counts = count_candidates(fasta, args.chrom, chrom_len)
@@ -155,8 +160,10 @@ def main() -> None:
         for array in arrays[name].values():
             array.flush()
     metadata = {
+        "device": str(device), "backend": "torch", "batch_size": batch_size,
         "schema": "droso_chrx_all_candidate_scores_v1", "checkpoint": str(args.checkpoint.resolve()),
-        "checkpoint_step": checkpoint["optimizer_step"], "checkpoint_epoch": None,
+        "checkpoint_step": checkpoint.get("optimizer_step"),
+        "checkpoint_epoch": checkpoint.get("epoch"),
         "fasta": str(args.fasta.resolve()), "chromosome": args.display_chrom,
         "fasta_sequence_name": args.chrom, "chromosome_length": chrom_len,
         "strand": "+", "window_size": window, "stride": stride,

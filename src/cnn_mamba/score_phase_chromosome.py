@@ -13,6 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
+from .inference import add_device_argument, resolve_device
 from .score_chromosome import encode, keep_bounds
 
 
@@ -23,7 +24,8 @@ def main():
     parser.add_argument("--chrom", required=True)
     parser.add_argument("--display-chrom", default="chrX")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int)
+    add_device_argument(parser)
     parser.add_argument(
         "--dtype", choices=("float16", "float32"), default="float32",
         help="Storage dtype for the [chromosome_length, 3] probability matrix.",
@@ -34,8 +36,10 @@ def main():
     if sentinel.is_file():
         print(f"already complete: {args.output_dir}", flush=True)
         return
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required")
+    device = resolve_device(args.device)
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("batch size must be positive")
+    args.batch_size = args.batch_size or (8 if device.type == "cuda" else 1)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
@@ -60,8 +64,8 @@ def main():
         dtype=np.uint8, shape=(chrom_len,),
     )
 
-    device = torch.device("cuda")
     model = model_from_checkpoint(checkpoint, device).eval()
+    print(f"device={device} backend=torch batch_size={args.batch_size}", flush=True)
     started = time.time()
     expected_position = 0
     with torch.inference_mode():
@@ -109,6 +113,7 @@ def main():
     probabilities.flush()
     argmax.flush()
     metadata = {
+        "device": str(device), "backend": "torch", "batch_size": args.batch_size,
         "schema": "per_base_phase_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),

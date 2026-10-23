@@ -16,6 +16,7 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from .model import model_from_checkpoint
+from .inference import add_device_argument, resolve_device
 from .temperature_scaling import (
     CLASS_ORDER, calibration_metrics, fit_temperature, joint_frame_targets,
 )
@@ -32,7 +33,7 @@ def collect_sample(model, loader, device, center_left, center_right,
     with torch.inference_mode():
         for batch_index, batch in enumerate(loader, 1):
             sequence = batch[0].to(device, non_blocking=True)
-            with autocast("cuda", enabled=amp):
+            with autocast(device.type, enabled=amp and device.type == "cuda"):
                 logits = model(sequence, return_joint_frame=True)[2]
             targets, valid = joint_frame_targets(batch[9], batch[10], batch[12])
             logits = logits[:, center_left:center_right]
@@ -121,7 +122,8 @@ def main():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--split", default="val")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int)
+    add_device_argument(parser)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--samples-per-window", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -131,8 +133,10 @@ def main():
     parser.add_argument("--minimum-temperature", type=float, default=0.05)
     parser.add_argument("--maximum-temperature", type=float, default=100.0)
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required to collect calibration logits")
+    device = resolve_device(args.device)
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("batch size must be positive")
+    args.batch_size = args.batch_size or (8 if device.type == "cuda" else 1)
     if args.samples_per_window < 1:
         parser.error("--samples-per-window must be positive")
 
@@ -153,11 +157,10 @@ def main():
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True,
+        num_workers=args.workers, pin_memory=device.type == "cuda",
         persistent_workers=args.workers > 0,
         prefetch_factor=2 if args.workers > 0 else None,
     )
-    device = torch.device("cuda")
     model = model_from_checkpoint(checkpoint, device).eval()
     logits, targets, collection = collect_sample(
         model, loader, device, center_left, center_right,

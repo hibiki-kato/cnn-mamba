@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Verify Mamba3 provenance and exercise its CUDA forward/backward when available."""
+"""Exercise portable inference and, when installed, CUDA research training."""
 
 import importlib.metadata as metadata
+import importlib.util
 import inspect
 import json
 from pathlib import Path
 
 import torch
-from mamba_ssm import Mamba3
 from cnn_mamba.model import SpliceMamba
 
 
@@ -15,6 +15,18 @@ EXPECTED_COMMIT = "be0303b971cd79a4fbbcfc411a01b33f6b0e3602"
 
 
 def main():
+    model = SpliceMamba(d_model=16, d_state=8, n_layers=1, dropout=0.0).eval()
+    with torch.inference_mode():
+        outputs = model(torch.randint(0, 5, (2, 101)))
+    assert all(output.shape == (2, 101, 3) for output in outputs)
+    assert all(torch.isfinite(output).all() for output in outputs)
+    print("Pure PyTorch CPU inference passed (one bidirectional Mamba3 layer)")
+
+    if not torch.cuda.is_available() or importlib.util.find_spec("mamba_ssm") is None:
+        print("CUDA training environment unavailable; training kernel test skipped")
+        return
+    from mamba_ssm import Mamba3
+
     distribution = metadata.distribution("mamba-ssm")
     direct_url = Path(distribution._path) / "direct_url.json"
     provenance = json.loads(direct_url.read_text()) if direct_url.is_file() else {}
@@ -27,15 +39,6 @@ def main():
             f"wrong mamba commit: {installed_commit}; expected {EXPECTED_COMMIT}"
         )
 
-    model = SpliceMamba(d_model=16, d_state=8, n_layers=0, dropout=0.0,
-                        architecture="cnn_mamba", cnn_kernel_size=7)
-    splice, start_stop = model(torch.randint(0, 5, (2, 101)))
-    assert splice.shape == start_stop.shape == (2, 101, 3)
-    print("CPU wrapper shape test passed")
-
-    if not torch.cuda.is_available():
-        print("CUDA unavailable; Mamba3 kernel test skipped")
-        return
     device = torch.device("cuda")
     layer = Mamba3(d_model=64, d_state=16, headdim=64).to(device)
     x = torch.randn(2, 256, 64, device=device, requires_grad=True)
@@ -46,6 +49,7 @@ def main():
     print(f"Mamba3 CUDA forward/backward passed on {torch.cuda.get_device_name(0)}")
 
     frame_model = SpliceMamba(
+        backend="triton",
         d_model=64, d_state=16, n_layers=1, dropout=0.1,
         architecture="cnn_mamba", cnn_kernel_size=7,
         frame_dilation=3, phase_auxiliary=True,

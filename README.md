@@ -44,6 +44,93 @@ PR--Sn curves, EviAnn operating points and strict locus results.
 
 ## 1. Install
 
+### Inference on Mac or a CPU-only HPC node
+
+Inference uses pure PyTorch on every device, including CUDA. It does not
+require `mamba-ssm`, Triton, `causal-conv1d`, a CUDA toolkit, or a compiler.
+Use Python 3.10–3.12. On Apple Silicon:
+
+```bash
+python -m pip install -e .
+```
+
+On a Linux CPU-only node, install the CPU PyTorch wheel first to avoid
+downloading CUDA runtime packages:
+
+```bash
+python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e .
+```
+
+The scoring interface and output formats are the same on all devices:
+
+```bash
+OMP_NUM_THREADS=1 cnn-mamba-score \
+  --checkpoint models/human_joint_frame_beta010_chr1held_epoch4_inference.pt \
+  --fasta /path/to/indexed_genome.fa --chrom NC_000001.11 \
+  --output-dir /path/to/new_scores --device cpu
+```
+
+`--device auto` (the default) selects CUDA, then Apple MPS, then CPU. Use
+`--device cpu` on Mac for the CPU path or `--device mps` for Apple GPU
+execution. The phase, joint-frame and gated-phase scoring modules accept
+the same option. CPU and MPS default to batch size 1; `--batch-size` overrides
+it. On HPC, set `OMP_NUM_THREADS` to the CPU allocation and benchmark the
+thread count; more threads need not improve small matrix operations.
+
+### Shared model and checkpoint interface
+
+Training and inference use the same `SpliceMamba`, `forward` arguments and
+`model_state_dict` keys/shapes. Published training checkpoints load directly;
+no export, conversion, or retraining is needed:
+
+```python
+import torch
+from cnn_mamba.model import SpliceMamba, model_from_checkpoint
+
+# Research training, in the CUDA training environment:
+training_model = SpliceMamba(backend="triton").to("cuda")
+
+# Deployment, using the same checkpoint and model API:
+saved = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
+model = model_from_checkpoint(saved, device="cpu").eval()
+with torch.inference_mode():
+    splice_logits, start_stop_logits = model(sequence.to("cpu"))
+```
+
+`SpliceMamba` defaults to `backend="torch"`; the training entry points
+explicitly select `backend="triton"` and retain their original optimized
+Mamba3 implementation, including validation during training. Standalone
+checkpoint loading and scoring always use PyTorch.
+
+The PyTorch implementation preserves Mamba3's SISO recurrence, trapezoidal
+discretization, partial rotary embedding, normalization and gates. It processes
+64-base blocks with bounded scan scratch space rather than allocating a
+sequence-length-squared attention matrix. Small floating-point differences
+from fused kernels are expected. The published 8-layer, bidirectional
+192-channel model has about 4.52 million parameters (18 MB in FP32); working
+RAM also includes activations, the input batch and the PyTorch runtime.
+Whole-genome inference still requires many overlapping 10 kb windows.
+Smaller models can use the same architecture and interface, but must be
+trained at those dimensions; changing checkpoint dimensions at load time
+does not shrink a trained model. Preserve its trained window geometry when
+comparing scores.
+
+Measure latency and whole-process peak RAM on the target node with:
+
+```bash
+python scripts/benchmark_inference.py \
+  --checkpoint models/human_joint_frame_beta010_chr1held_epoch4_inference.pt \
+  --device cpu --batch-size 1 --threads 1
+```
+
+Run `python scripts/smoke_model.py` for a CPU inference check, and
+`python -m unittest discover -s tests -v` for recurrence, checkpoint and CLI
+tests. CUDA/Triton parity and MPS parity tests run when their hardware is
+available; CPU tests alone do not establish accelerator parity or speed.
+
+### CUDA research training
+
 The recorded environment used Python 3.10, PyTorch 2.6.0+cu124 and a Git build
 of Mamba at commit `be0303b971cd79a4fbbcfc411a01b33f6b0e3602`. Its package
 metadata says `mamba-ssm==2.3.1`, but the PyPI 2.3.1 source is not equivalent:

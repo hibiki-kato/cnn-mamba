@@ -783,6 +783,7 @@ def main():
             )
 
     model = SpliceMamba(
+        backend="triton",
         d_model=192,
         d_state=64,
         n_layers=8,

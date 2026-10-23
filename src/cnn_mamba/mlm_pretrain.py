@@ -97,6 +97,7 @@ class CNNMambaMLM(nn.Module):
                  cnn_kernel_size=7):
         super().__init__()
         self.backbone = SpliceMamba(
+            backend="triton",
             d_model=d_model,
             d_state=d_state,
             n_layers=n_layers,

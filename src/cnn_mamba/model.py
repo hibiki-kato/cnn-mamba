@@ -3,13 +3,30 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba_ssm import Mamba3
 from torch.utils.checkpoint import checkpoint
+
+from .mamba3_torch import Mamba3Torch
+
+
+def _mamba3_class(backend):
+    if backend == "torch":
+        return Mamba3Torch
+    if backend == "triton":
+        try:
+            from mamba_ssm import Mamba3
+        except ImportError as error:
+            raise ImportError(
+                "Triton training requires the pinned Mamba3 environment; "
+                "see environment.yml. For inference use backend='torch'."
+            ) from error
+        return Mamba3
+    raise ValueError(f"unsupported Mamba3 backend: {backend}")
 
 
 class BiMamba3Block(nn.Module):
-    def __init__(self, d_model: int, d_state: int, headdim: int):
+    def __init__(self, d_model: int, d_state: int, headdim: int, backend="torch"):
         super().__init__()
+        Mamba3 = _mamba3_class(backend)
         self.fw = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim)
         self.bw = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim)
 
@@ -18,7 +35,8 @@ class BiMamba3Block(nn.Module):
 
 
 class CNNBiMamba3Block(nn.Module):
-    def __init__(self, d_model, d_state, headdim, dropout, kernel_size=7):
+    def __init__(self, d_model, d_state, headdim, dropout, kernel_size=7,
+                 backend="torch"):
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 == 0:
             raise ValueError("cnn_kernel_size must be a positive odd integer")
@@ -30,7 +48,7 @@ class CNNBiMamba3Block(nn.Module):
         self.pointwise = nn.Conv1d(d_model, d_model, kernel_size=1)
         self.cnn_drop = nn.Dropout(dropout)
         self.mamba_norm = nn.LayerNorm(d_model)
-        self.mamba = BiMamba3Block(d_model, d_state, headdim)
+        self.mamba = BiMamba3Block(d_model, d_state, headdim, backend)
         self.mamba_drop = nn.Dropout(dropout)
         nn.init.ones_(self.cnn_norm.weight)
         nn.init.zeros_(self.cnn_norm.bias)
@@ -83,11 +101,14 @@ class SpliceMamba(nn.Module):
                  architecture="cnn_mamba", cnn_kernel_size=7,
                  frame_dilation=0, phase_auxiliary=False,
                  cds_auxiliary=False, joint_frame_auxiliary=False,
-                 vocab_size=5):
+                 vocab_size=5, backend="torch"):
         super().__init__()
         if architecture not in {"mamba", "cnn_mamba"}:
             raise ValueError(f"unsupported architecture: {architecture}")
+        if backend not in {"torch", "triton"}:
+            raise ValueError(f"unsupported Mamba3 backend: {backend}")
         self.architecture = architecture
+        self.backend = backend
         self.gradient_checkpointing = False
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.input_proj = nn.Sequential(
@@ -97,13 +118,14 @@ class SpliceMamba(nn.Module):
         if architecture == "mamba":
             self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(n_layers)])
             self.layers = nn.ModuleList([
-                BiMamba3Block(d_model, d_state, min(64, d_model))
+                BiMamba3Block(d_model, d_state, min(64, d_model), backend)
                 for _ in range(n_layers)
             ])
             self.drops = nn.ModuleList([nn.Dropout(dropout) for _ in range(n_layers)])
         else:
             self.layers = nn.ModuleList([
-                CNNBiMamba3Block(d_model, d_state, min(64, d_model), dropout, cnn_kernel_size)
+                CNNBiMamba3Block(d_model, d_state, min(64, d_model), dropout,
+                                 cnn_kernel_size, backend)
                 for _ in range(n_layers)
             ])
         self.final_norm = nn.LayerNorm(d_model)
