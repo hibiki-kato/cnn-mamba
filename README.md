@@ -91,7 +91,8 @@ More threads need not improve small matrix operations.
 `--precision bf16` optionally uses BF16 for projections/CNN operations while
 keeping scan state and scan matrix operations in FP32. The default is `fp32`.
 Scores and close class decisions can change; this is not an accuracy-preserving
-conversion. Measure it on the target hardware: our Ryzen 9950X benefited, CUDA
+conversion. Use a new output directory when changing precision; completed
+scores from a different precision are not reused. Measure it on the target hardware: our Ryzen 9950X benefited, CUDA
 improved modestly, and M4 MPS with PyTorch 2.6.0 did not improve. FP16 inference
 is not offered because the published checkpoint produced non-finite outputs.
 

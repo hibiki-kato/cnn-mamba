@@ -16,7 +16,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision, completed_output
 
 ENCODE = np.full(256, 4, dtype=np.uint8)
 for _base, _value in (("A", 0), ("C", 1), ("G", 2), ("T", 3)):
@@ -90,7 +90,7 @@ def main() -> None:
     add_batch_arguments(parser)
     add_device_argument(parser)
     args = parser.parse_args()
-    if (args.output_dir / ".complete.json").is_file():
+    if completed_output(args.output_dir, args.precision):
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)

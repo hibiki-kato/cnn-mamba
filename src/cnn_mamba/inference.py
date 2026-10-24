@@ -1,6 +1,7 @@
 """Device and memory-aware batching shared by PyTorch inference commands."""
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -112,6 +113,18 @@ def inference_precision(precision, device):
     if precision not in {'fp32', 'bf16'}:
         raise ValueError(f'unsupported inference precision: {precision}')
     return torch.autocast(device.type, dtype=torch.bfloat16, enabled=precision == 'bf16')
+
+
+def completed_output(output_dir, precision):
+    """Reuse completed scores only when their numerical precision matches."""
+    if not (output_dir / '.complete.json').is_file():
+        return False
+    metadata = json.loads((output_dir / 'metadata.json').read_text())
+    previous = metadata.get('precision', 'fp32')
+    if previous != precision:
+        raise ValueError(f'completed output uses precision {previous}, requested {precision}; '
+                         'choose a different output directory')
+    return True
 
 
 def resolve_device(name="auto"):

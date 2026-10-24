@@ -1,15 +1,28 @@
 import argparse
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from cnn_mamba.inference import add_batch_arguments, configure_batch_size, configure_threads, hardware_memory
+from cnn_mamba.inference import add_batch_arguments, configure_batch_size, configure_threads, hardware_memory, completed_output
 from cnn_mamba.model import SpliceMamba
 
 
 class BatchTests(unittest.TestCase):
+    def test_completed_legacy_outputs_are_fp32_and_precision_changes_need_new_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertFalse(completed_output(root, 'bf16'))
+            (root/'.complete.json').write_text('{}')
+            (root/'metadata.json').write_text(json.dumps({'backend': 'torch'}))
+            self.assertTrue(completed_output(root, 'fp32'))
+            with self.assertRaisesRegex(ValueError, 'different output directory'):
+                completed_output(root, 'bf16')
+
     def setUp(self):
         self.parser = argparse.ArgumentParser()
         add_batch_arguments(self.parser)

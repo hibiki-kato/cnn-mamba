@@ -242,6 +242,9 @@ assert "mamba_ssm" not in sys.modules
                     with patch.object(sys, 'argv', bf16_argv):
                         module.main()
                     self.assertEqual(json.loads((bf16_destination/'metadata.json').read_text())['precision'], 'bf16')
+                    wrong_precision = argv + ['--precision', 'bf16']
+                    with patch.object(sys, 'argv', wrong_precision), self.assertRaisesRegex(ValueError, 'precision'):
+                        module.main()
                     for path in destination.glob('*.npy'):
                         values = np.load(bf16_destination/path.name)
                         self.assertTrue(np.isfinite(values).all())

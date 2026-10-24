@@ -13,7 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision, completed_output
 from .score_chromosome import encode, keep_bounds
 
 
@@ -36,7 +36,7 @@ def main():
     )
     args = parser.parse_args()
     sentinel = args.output_dir / ".complete.json"
-    if sentinel.is_file():
+    if completed_output(args.output_dir, args.precision):
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
