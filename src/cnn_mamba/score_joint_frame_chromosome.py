@@ -13,7 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision
 from .score_chromosome import encode, keep_bounds
 
 
@@ -117,7 +117,7 @@ def main():
     )
     expected_position = 0
     started = time.time()
-    with torch.inference_mode():
+    with torch.inference_mode(), inference_precision(args.precision, device):
         for batch_start in range(0, len(starts), args.batch_size):
             batch_starts = starts[batch_start:batch_start + args.batch_size]
             encoded = []
@@ -173,7 +173,7 @@ def main():
     if saved_logits is not None:
         saved_logits.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(), "batch_size": args.batch_size,
+        "device": str(device), "backend": "torch", "precision": args.precision, "threads": torch.get_num_threads(), "batch_size": args.batch_size,
         "schema": "joint_frame_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint["epoch"]),

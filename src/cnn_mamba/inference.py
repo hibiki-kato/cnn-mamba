@@ -103,6 +103,15 @@ def add_device_argument(parser, threads_default=None):
     )
     parser.add_argument("--threads", type=int, default=threads_default,
                         help="CPU threads; overrides OMP/MKL settings. Defaults respect job allocation.")
+    parser.add_argument('--precision', choices=('fp32', 'bf16'), default='fp32',
+                        help='BF16 projections/CNN with FP32 scan accumulation; scores can differ. Default: fp32.')
+
+
+def inference_precision(precision, device):
+    """Explicit optional mixed precision; never switch dtype based on timing."""
+    if precision not in {'fp32', 'bf16'}:
+        raise ValueError(f'unsupported inference precision: {precision}')
+    return torch.autocast(device.type, dtype=torch.bfloat16, enabled=precision == 'bf16')
 
 
 def resolve_device(name="auto"):

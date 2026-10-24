@@ -16,7 +16,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision
 
 ENCODE = np.full(256, 4, dtype=np.uint8)
 for _base, _value in (("A", 0), ("C", 1), ("G", 2), ("T", 3)):
@@ -123,9 +123,9 @@ def main() -> None:
             encoded.append(encode(text + "N" * (window - len(text))))
         encoded = np.stack(encoded)
         tensor = torch.from_numpy(encoded).long().to(device)
-        with torch.inference_mode():
+        with torch.inference_mode(), inference_precision(args.precision, device):
             splice, start_stop = model(tensor)
-            splice, start_stop = splice.softmax(-1).float().cpu().numpy(), start_stop.softmax(-1).float().cpu().numpy()
+            splice, start_stop = splice.float().softmax(-1).cpu().numpy(), start_stop.float().softmax(-1).cpu().numpy()
         for local_index, (start, sequence) in enumerate(zip(batch_starts, encoded)):
             index = batch_start + local_index
             left, right = keep_bounds(index, len(starts), window, stride)
@@ -157,7 +157,7 @@ def main() -> None:
         for array in arrays[name].values():
             array.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(), "batch_size": batch_size,
+        "device": str(device), "backend": "torch", "precision": args.precision, "threads": torch.get_num_threads(), "batch_size": batch_size,
         "schema": "droso_chrx_all_candidate_scores_v1", "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_step": checkpoint.get("optimizer_step"),
         "checkpoint_epoch": checkpoint.get("epoch"),

@@ -24,7 +24,7 @@ from .train import PUDataset
 
 
 def collect_sample(model, loader, device, center_left, center_right,
-                   samples_per_window, seed, amp):
+                   samples_per_window, seed, amp, precision='fp32'):
     """Uniformly sample owned center bases while performing one validation pass."""
     generator = torch.Generator().manual_seed(seed)
     sampled_logits, sampled_targets = [], []
@@ -33,7 +33,8 @@ def collect_sample(model, loader, device, center_left, center_right,
     with torch.inference_mode():
         for batch_index, batch in enumerate(loader, 1):
             sequence = batch[0].to(device, non_blocking=True)
-            with autocast(device.type, enabled=amp and device.type == "cuda"):
+            with autocast(device.type, enabled=precision == 'bf16' or (amp and device.type == "cuda"),
+                          dtype=torch.bfloat16 if precision == 'bf16' else torch.float16):
                 logits = model(sequence, return_joint_frame=True)[2]
             targets, valid = joint_frame_targets(batch[9], batch[10], batch[12])
             logits = logits[:, center_left:center_right]
@@ -60,7 +61,7 @@ def collect_sample(model, loader, device, center_left, center_right,
                 )
     return (
         torch.cat(sampled_logits), torch.cat(sampled_targets),
-        {"valid_owned_bases_seen": seen_valid,
+        {"precision": precision, "valid_owned_bases_seen": seen_valid,
          "coding_owned_bases_seen": seen_coding,
          "inference_seconds": time.time() - started},
     )
@@ -164,6 +165,7 @@ def main():
     logits, targets, collection = collect_sample(
         model, loader, device, center_left, center_right,
         args.samples_per_window, args.seed, args.amp,
+        precision=args.precision,
     )
     noncoding_weight = float(config.get("joint_noncoding_weight", 0.1))
     empirical_temperature = fit_temperature(

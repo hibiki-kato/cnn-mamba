@@ -15,7 +15,7 @@ import torch
 
 from cnn_mamba.inference import (
     add_batch_arguments, add_device_argument, hardware_memory,
-    configure_batch_size, resolve_device,
+    configure_batch_size, resolve_device, inference_precision,
 )
 from cnn_mamba.model import model_from_checkpoint
 from cnn_mamba.mamba3_torch import Mamba3Torch
@@ -63,7 +63,7 @@ def main():
     timings = []
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    with torch.inference_mode():
+    with torch.inference_mode(), inference_precision(args.precision, device):
         model(sequence, **extra_outputs)  # warm up
         synchronize()
         for _ in range(args.repeats):
@@ -81,6 +81,7 @@ def main():
         "checkpoint": str(args.checkpoint), "checkpoint_sha256": digest.hexdigest(),
         "torch": torch.__version__, "python": platform.python_version(),
         "platform": platform.platform(), "device": str(device), "backend": model.backend,
+        "precision": args.precision,
         "accelerator_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "cuda_runtime": torch.version.cuda, "hip_runtime": torch.version.hip,
         "threads": args.threads, "batch_size": args.batch_size,

@@ -26,11 +26,16 @@ def _mamba3_class(backend):
 class BiMamba3Block(nn.Module):
     def __init__(self, d_model: int, d_state: int, headdim: int, backend="torch"):
         super().__init__()
+        self.backend = backend
+        self.fuse_directions = False
         Mamba3 = _mamba3_class(backend)
         self.fw = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim)
         self.bw = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim)
 
     def forward(self, x):
+        if self.fuse_directions:
+            from .mamba3_native import fused_bidirectional
+            return fused_bidirectional(self, x)
         return self.fw(x) + self.bw(x.flip(1)).flip(1)
 
 
@@ -150,6 +155,14 @@ class SpliceMamba(nn.Module):
         self.joint_frame_head = (
             nn.Linear(d_model, 4) if joint_frame_auxiliary else None
         )
+
+    def enable_bidirectional_fusion(self):
+        """Enable the optional native scan fusion without changing weights/API."""
+        if self.backend != 'triton':
+            raise ValueError('bidirectional fusion requires the native Triton backend')
+        for layer in self.modules():
+            if isinstance(layer, BiMamba3Block):
+                layer.fuse_directions = True
 
     def encode(self, sequence):
         """Return shared per-base features before task-specific branches."""

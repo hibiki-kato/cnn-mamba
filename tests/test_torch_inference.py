@@ -15,7 +15,7 @@ import pysam
 import torch
 from torch.nn import functional as F
 
-from cnn_mamba.inference import resolve_device
+from cnn_mamba.inference import resolve_device, inference_precision
 from cnn_mamba.mamba3_torch import Mamba3Torch, siso_scan
 from cnn_mamba.model import SpliceMamba, model_from_checkpoint
 
@@ -59,6 +59,23 @@ def recurrent_reference(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z)
 
 
 class TorchInferenceTests(unittest.TestCase):
+    def test_bf16_autocast_preserves_fp32_scan_context_and_checkpoint(self):
+        model = SpliceMamba(d_model=64, d_state=16, n_layers=1, dropout=0.0).eval()
+        keys = tuple(model.state_dict())
+        module = importlib.import_module('cnn_mamba.mamba3_torch')
+        scan = module.siso_scan
+        contexts = []
+        def observed(*args, **kwargs):
+            contexts.append(torch.is_autocast_enabled('cpu'))
+            return scan(*args, **kwargs)
+        with patch.object(module, 'siso_scan', observed), torch.inference_mode(), inference_precision('bf16', torch.device('cpu')):
+            outputs = model(torch.randint(0, 5, (2, 129)))
+        self.assertEqual(contexts, [False, False])
+        self.assertTrue(all(y.dtype == torch.bfloat16 and torch.isfinite(y).all() for y in outputs))
+        self.assertEqual(tuple(model.state_dict()), keys)
+        with self.assertRaises(ValueError):
+            model.enable_bidirectional_fusion()
+
     def test_execution_group_uses_shape_without_hardware_probes(self):
         layer = Mamba3Torch(d_model=192, d_state=64, headdim=64)
         with patch("torch.cuda.get_device_properties", side_effect=AssertionError("no runtime probe")):
@@ -218,6 +235,52 @@ assert "mamba_ssm" not in sys.modules
                             np.testing.assert_allclose(after, before, rtol=2e-5, atol=2e-6)
                         else:
                             np.testing.assert_array_equal(after, before)
+                    bf16_destination = root / (name + '_bf16')
+                    bf16_argv = argv.copy()
+                    bf16_argv[bf16_argv.index('--output-dir') + 1] = str(bf16_destination)
+                    bf16_argv += ['--precision', 'bf16']
+                    with patch.object(sys, 'argv', bf16_argv):
+                        module.main()
+                    self.assertEqual(json.loads((bf16_destination/'metadata.json').read_text())['precision'], 'bf16')
+                    for path in destination.glob('*.npy'):
+                        values = np.load(bf16_destination/path.name)
+                        self.assertTrue(np.isfinite(values).all())
+                        # Reduced precision can change a close class decision;
+                        # candidate positions/motif identifiers remain exact.
+                        if not np.issubdtype(values.dtype, np.floating) and 'argmax' not in path.name:
+                            np.testing.assert_array_equal(values, np.load(path))
+                        if path.name == 'joint_frame_argmax.npy':
+                            probabilities = np.load(bf16_destination/'joint_frame_probabilities.npy')
+                            np.testing.assert_array_equal(values, probabilities.argmax(-1))
+
+    @unittest.skipUnless(torch.cuda.is_available() and importlib.util.find_spec('mamba_ssm'),
+                         'native CUDA training environment unavailable')
+    def test_native_bidirectional_fusion_preserves_outputs_gradients_and_keys(self):
+        if torch.version.hip is not None:
+            self.skipTest('native training kernels require NVIDIA CUDA')
+        from cnn_mamba.model import BiMamba3Block
+        torch.manual_seed(107)
+        original = BiMamba3Block(64, 16, 64, backend='triton').cuda()
+        fused = BiMamba3Block(64, 16, 64, backend='triton').cuda()
+        fused.load_state_dict(original.state_dict(), strict=True)
+        fused.fuse_directions = True
+        for length in (64, 65, 129):
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(length=length, dtype=dtype):
+                    original.zero_grad(set_to_none=True)
+                    fused.zero_grad(set_to_none=True)
+                    x = torch.randn(2, length, 64, device='cuda', requires_grad=True)
+                    y = x.detach().clone().requires_grad_()
+                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=dtype==torch.bfloat16):
+                        a, b = original(x), fused(y)
+                        loss_a, loss_b = a.float().square().mean(), b.float().square().mean()
+                    torch.testing.assert_close(b, a, rtol=2e-4, atol=2e-5)
+                    loss_a.backward()
+                    loss_b.backward()
+                    torch.testing.assert_close(y.grad, x.grad, rtol=2e-4, atol=2e-5)
+                    self.assertEqual(tuple(fused.state_dict()), tuple(original.state_dict()))
+                    for before, after in zip(original.parameters(), fused.parameters()):
+                        torch.testing.assert_close(after.grad, before.grad, rtol=2e-4, atol=2e-5)
 
     @unittest.skipUnless(importlib.util.find_spec("mamba_ssm"), "optional Mamba3 training package absent")
     def test_upstream_state_dict_loads_strictly_in_both_directions(self):
@@ -277,8 +340,8 @@ assert "mamba_ssm" not in sys.modules
             self.skipTest("upstream training kernels require NVIDIA CUDA")
         if not importlib.util.find_spec("mamba_ssm"):
             self.skipTest("optional Mamba3 training package absent")
-        if torch.cuda.get_device_capability()[0] < 9:
-            self.skipTest("upstream Mamba3 TMA kernels require SM90 or newer")
+        if not torch.cuda.is_bf16_supported():
+            self.skipTest('native Mamba3 kernels require BF16 support')
         torch.manual_seed(42)
         training = SpliceMamba(d_model=64, d_state=16, n_layers=1,
                                dropout=0.0, backend="triton").cuda().eval()

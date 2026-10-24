@@ -88,6 +88,13 @@ inference uses at most eight threads (four on Mac), respecting CPU affinity
 and `SLURM_CPUS_PER_TASK`. Accelerator inference defaults to one host thread.
 More threads need not improve small matrix operations.
 
+`--precision bf16` optionally uses BF16 for projections/CNN operations while
+keeping scan state and scan matrix operations in FP32. The default is `fp32`.
+Scores and close class decisions can change; this is not an accuracy-preserving
+conversion. Measure it on the target hardware: our Ryzen 9950X benefited, CUDA
+improved modestly, and M4 MPS with PyTorch 2.6.0 did not improve. FP16 inference
+is not offered because the published checkpoint produced non-finite outputs.
+
 Batch selection uses total CUDA VRAM, CPU RAM, or the Mac's shared RAM capped
 by Metal's recommended working-set capacity. It performs no live memory
 monitoring, trial forwards, or runtime batch resizing. `--memory-fraction`
@@ -179,6 +186,38 @@ conda activate cnn_mamba_k7
 pip install -e . --no-deps --no-build-isolation
 python scripts/smoke_model.py
 ```
+
+Training supports optional BF16 AMP and static capacity-based microbatches:
+
+```bash
+python -m cnn_mamba.train --mode baseline --data-root /path/to/processed \
+  --batch-size auto --effective-batch-size 8 \
+  --amp --amp-dtype bfloat16 --fuse-bidirectional
+```
+
+`--batch-size auto` reads total VRAM once and estimates activation, parameter,
+gradient and optimizer memory from window/model dimensions and precision.
+It reserves headroom (`--memory-fraction 0.8` by default), supports a fixed
+allocation override with `--memory-gb`, and caps the microbatch with
+`--max-batch-size`. It performs no trial steps, live memory monitoring or OOM
+backoff. This is a conservative capacity estimate, not a guarantee of fit or
+maximum speed. Gradient checkpointing does not reduce this estimate.
+
+The selected microbatch divides `--effective-batch-size`, and accumulation is
+adjusted to preserve samples per optimizer step. Without an explicit effective
+size, auto uses the historical microbatch 4 times `--grad-accum` (8 by default).
+Manual batch/accumulation defaults remain 4 and 2. Changing microbatching still
+changes floating-point summation and dropout draws; it does not promise an
+identical training trajectory. The last partial update can also be smaller.
+
+`--amp` retains FP16 as its default; add `--amp-dtype bfloat16` for BF16, which
+uses FP32 master parameters and no active gradient scaler. The optional
+`--fuse-bidirectional` combines independent forward/backward heads in one native
+scan. It preserves parameter keys, the forward API and gradients, but uses
+additional concatenation buffers (approximately 18% more peak VRAM in our
+batch-4 test). It applies only to the native training backend; standalone
+inference continues to use the portable implementation. Existing research
+commands keep their original settings unless these options are specified.
 
 For a newer CUDA stack, install a matching PyTorch build first, then compile or
 install `causal-conv1d` and `mamba-ssm` against it. Do not assume a wheel built

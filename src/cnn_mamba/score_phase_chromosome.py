@@ -13,7 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision
 from .score_chromosome import encode, keep_bounds
 
 
@@ -67,7 +67,7 @@ def main():
     print(f"device={device} backend=torch batch_size={args.batch_size}", flush=True)
     started = time.time()
     expected_position = 0
-    with torch.inference_mode():
+    with torch.inference_mode(), inference_precision(args.precision, device):
         for batch_start in range(0, len(starts), args.batch_size):
             batch_starts = starts[batch_start:batch_start + args.batch_size]
             encoded = []
@@ -78,7 +78,7 @@ def main():
                 encoded.append(encode(text + "N" * (window - len(text))))
             sequence = torch.from_numpy(np.stack(encoded)).long().to(device)
             _, _, phase_logits = model(sequence, return_phase=True)
-            phase_probs = phase_logits.softmax(-1).float().cpu().numpy()
+            phase_probs = phase_logits.float().softmax(-1).cpu().numpy()
 
             for local_index, start in enumerate(batch_starts):
                 window_index = batch_start + local_index
@@ -112,7 +112,7 @@ def main():
     probabilities.flush()
     argmax.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(), "batch_size": args.batch_size,
+        "device": str(device), "backend": "torch", "precision": args.precision, "threads": torch.get_num_threads(), "batch_size": args.batch_size,
         "schema": "per_base_phase_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),

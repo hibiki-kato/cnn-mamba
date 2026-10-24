@@ -219,6 +219,9 @@ class Mamba3Torch(nn.Module):
 
     def forward(self, u):
         batch, length, _ = u.shape
-        y = siso_scan(*self.prepare(self.in_proj(u)),
-                      self.chunk_size, self.scan_group_size(batch, u.device))
+        values = self.prepare(self.in_proj(u))
+        # Outer autocast may use BF16 for projections, but recurrent state and
+        # scan matrix operations retain FP32 accumulation on every device.
+        with torch.autocast(u.device.type, enabled=False):
+            y = siso_scan(*values, self.chunk_size, self.scan_group_size(batch, u.device))
         return self.out_proj(y.reshape(batch, length, self.d_inner))
