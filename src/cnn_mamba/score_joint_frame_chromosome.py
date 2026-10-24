@@ -13,7 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
 from .score_chromosome import encode, keep_bounds
 
 
@@ -70,6 +70,7 @@ def main():
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
+    configure_threads(args.threads, device)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
@@ -172,7 +173,7 @@ def main():
     if saved_logits is not None:
         saved_logits.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "batch_size": args.batch_size,
+        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(), "batch_size": args.batch_size,
         "schema": "joint_frame_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint["epoch"]),

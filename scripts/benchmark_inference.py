@@ -18,15 +18,17 @@ from cnn_mamba.inference import (
     configure_batch_size, resolve_device,
 )
 from cnn_mamba.model import model_from_checkpoint
+from cnn_mamba.mamba3_torch import Mamba3Torch
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     add_batch_arguments(parser, default=1)
-    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
-    add_device_argument(parser)
+    parser.add_argument("--scan-chunks-per-group", type=int,
+                        help="Override the scan execution grouping for this benchmark only.")
+    add_device_argument(parser, threads_default=1)
     args = parser.parse_args()
     if min(args.threads, args.repeats) < 1:
         parser.error("batch size, threads and repeats must be positive")
@@ -35,6 +37,12 @@ def main():
     device = resolve_device(args.device)
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = model_from_checkpoint(saved, device).eval()
+    scan_layers = [layer for layer in model.modules() if isinstance(layer, Mamba3Torch)]
+    if args.scan_chunks_per_group is not None:
+        if args.scan_chunks_per_group < 1:
+            parser.error("scan chunks per group must be positive")
+        for layer in scan_layers:
+            layer.chunks_per_group = args.scan_chunks_per_group
     length = int(saved["config"]["window_size"])
     memory_capacity = hardware_memory(device) if args.memory_gb is None else args.memory_gb * 1024**3
     requested_batch = args.batch_size
@@ -53,6 +61,8 @@ def main():
             torch.mps.synchronize()
 
     timings = []
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     with torch.inference_mode():
         model(sequence, **extra_outputs)  # warm up
         synchronize()
@@ -71,10 +81,19 @@ def main():
         "checkpoint": str(args.checkpoint), "checkpoint_sha256": digest.hexdigest(),
         "torch": torch.__version__, "python": platform.python_version(),
         "platform": platform.platform(), "device": str(device), "backend": model.backend,
+        "accelerator_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "cuda_runtime": torch.version.cuda, "hip_runtime": torch.version.hip,
         "threads": args.threads, "batch_size": args.batch_size,
         "requested_batch_size": requested_batch,
         "memory_fraction": args.memory_fraction,
         "memory_capacity_bytes": memory_capacity,
+        "scan_chunks_per_group": sorted({layer.scan_group_size(args.batch_size, device) for layer in scan_layers}),
+        "cuda_peak_allocated_bytes": (
+            torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+        ),
+        "cuda_peak_reserved_bytes": (
+            torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None
+        ),
         "window_size": length, "stride": saved["config"].get("stride"),
         "parameters": sum(p.numel() for p in model.parameters()),
         "seconds_per_batch": timings, "median_seconds_per_batch": statistics.median(timings),

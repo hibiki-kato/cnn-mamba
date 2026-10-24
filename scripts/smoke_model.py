@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise portable inference and, when installed, CUDA research training."""
 
+import argparse
 import importlib.metadata as metadata
 import importlib.util
 import inspect
@@ -15,14 +16,31 @@ EXPECTED_COMMIT = "be0303b971cd79a4fbbcfc411a01b33f6b0e3602"
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--inference-only", action="store_true",
+                        help="Check portable CPU/GPU inference without importing research training packages.")
+    args = parser.parse_args()
     model = SpliceMamba(d_model=16, d_state=8, n_layers=1, dropout=0.0).eval()
+    sequence = torch.randint(0, 5, (2, 101))
     with torch.inference_mode():
-        outputs = model(torch.randint(0, 5, (2, 101)))
+        outputs = model(sequence)
     assert all(output.shape == (2, 101, 3) for output in outputs)
     assert all(torch.isfinite(output).all() for output in outputs)
     print("Pure PyTorch CPU inference passed (one bidirectional Mamba3 layer)")
 
-    if not torch.cuda.is_available() or importlib.util.find_spec("mamba_ssm") is None:
+    devices = (["cuda"] if torch.cuda.is_available() else [])
+    if torch.backends.mps.is_available():
+        devices.append("mps")
+    for device in devices:
+        with torch.inference_mode():
+            accelerated = model.to(device)(sequence.to(device))
+        for reference, output in zip(outputs, accelerated):
+            torch.testing.assert_close(output.cpu(), reference, rtol=3e-4, atol=3e-4)
+        print(f"Pure PyTorch {device} inference passed" + (" (ROCm)" if torch.version.hip else ""))
+    if args.inference_only:
+        return
+    if (not torch.cuda.is_available() or torch.version.hip is not None
+            or importlib.util.find_spec("mamba_ssm") is None):
         print("CUDA training environment unavailable; training kernel test skipped")
         return
     from mamba_ssm import Mamba3

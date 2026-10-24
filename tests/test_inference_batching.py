@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from cnn_mamba.inference import add_batch_arguments, configure_batch_size, hardware_memory
+from cnn_mamba.inference import add_batch_arguments, configure_batch_size, configure_threads, hardware_memory
 from cnn_mamba.model import SpliceMamba
 
 
@@ -68,6 +68,25 @@ class BatchTests(unittest.TestCase):
             single = [self.model(row, return_joint_frame=True) for row in sequence.split(1)]
             for actual, parts in zip(batch, zip(*single)):
                 torch.testing.assert_close(actual, torch.cat(parts), rtol=2e-5, atol=2e-6)
+
+    def test_thread_defaults_respect_hpc_allocation_and_environment(self):
+        with patch.dict("os.environ", {}, clear=True), patch(
+                "cnn_mamba.inference.sys.platform", "linux"), patch(
+                "torch.get_num_threads", return_value=16), patch(
+                "os.sched_getaffinity", return_value=set(range(16)), create=True), patch("torch.set_num_threads") as setter:
+            configure_threads(None, torch.device("cpu"))
+            setter.assert_called_once_with(8)
+        with patch.dict("os.environ", {"SLURM_CPUS_PER_TASK": "2"}, clear=True), patch(
+                "torch.get_num_threads", return_value=16), patch(
+                "os.sched_getaffinity", return_value=set(range(16)), create=True), patch("torch.set_num_threads") as setter:
+            configure_threads(None, torch.device("cpu"))
+            setter.assert_called_once_with(2)
+        with patch.dict("os.environ", {"OMP_NUM_THREADS": "12"}, clear=True), patch(
+                "torch.get_num_threads", return_value=12), patch("torch.set_num_threads") as setter:
+            self.assertEqual(configure_threads(None, torch.device("cpu")), 12)
+            setter.assert_not_called()
+            configure_threads(3, torch.device("cpu"))
+            setter.assert_called_once_with(3)
 
 
 if __name__ == "__main__":

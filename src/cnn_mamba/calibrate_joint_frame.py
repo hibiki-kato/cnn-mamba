@@ -16,7 +16,7 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
 from .temperature_scaling import (
     CLASS_ORDER, calibration_metrics, fit_temperature, joint_frame_targets,
 )
@@ -134,6 +134,7 @@ def main():
     parser.add_argument("--maximum-temperature", type=float, default=100.0)
     args = parser.parse_args()
     device = resolve_device(args.device)
+    configure_threads(args.threads, device)
     if args.samples_per_window < 1:
         parser.error("--samples-per-window must be positive")
 

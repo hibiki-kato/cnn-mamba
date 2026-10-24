@@ -59,9 +59,21 @@ def recurrent_reference(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z)
 
 
 class TorchInferenceTests(unittest.TestCase):
+    def test_execution_group_uses_shape_without_hardware_probes(self):
+        layer = Mamba3Torch(d_model=192, d_state=64, headdim=64)
+        with patch("torch.cuda.get_device_properties", side_effect=AssertionError("no runtime probe")):
+            self.assertEqual(layer.scan_group_size(1, torch.device("cuda")), 64)
+            self.assertEqual(layer.scan_group_size(4, torch.device("cuda")), 16)
+            self.assertEqual(layer.scan_group_size(16, torch.device("cuda")), 4)
+        self.assertEqual(layer.scan_group_size(1, torch.device("cpu")), 16)
+        self.assertEqual(layer.scan_group_size(4, torch.device("cpu")), 4)
+        self.assertEqual(layer.scan_group_size(1, torch.device("mps")), 16)
+        layer.chunks_per_group = 7
+        self.assertEqual(layer.scan_group_size(1, torch.device("cuda")), 7)
+
     def test_scan_matches_independent_recurrence_across_blocks(self):
         torch.manual_seed(123)
-        for length in (1, 63, 64, 65, 129):
+        for length in (1, 63, 64, 65, 129, 1025, 1091):
             batch, heads, width, state = 2, 3, 4, 8
             q = torch.randn(batch, length, 1, state)
             k = torch.randn_like(q)
@@ -73,9 +85,14 @@ class TorchInferenceTests(unittest.TestCase):
                     torch.randn(heads), torch.randn_like(v))
             expected = recurrent_reference(*args)
             for chunk_size in (16, 64):
-                with self.subTest(length=length, chunk_size=chunk_size):
-                    actual = siso_scan(*args, chunk_size=chunk_size)
-                    torch.testing.assert_close(actual.double(), expected, rtol=2e-5, atol=8e-6)
+                for chunks_per_group in (1, 4, 16):
+                    with self.subTest(length=length, chunk_size=chunk_size,
+                                      chunks_per_group=chunks_per_group):
+                        actual = siso_scan(*args, chunk_size=chunk_size,
+                                           chunks_per_group=chunks_per_group)
+                        # Parallel block sums reassociate float32 angle/decay
+                        # additions; the independent reference accumulates in float64.
+                        torch.testing.assert_close(actual.double(), expected, rtol=3e-5, atol=2e-5)
 
     def test_scan_stays_finite_under_large_decay_and_angle_increments(self):
         torch.manual_seed(124)
@@ -241,7 +258,23 @@ assert "mamba_ssm" not in sys.modules
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_portable_accelerator_matches_cpu_without_training_kernels(self):
+        # ROCm deliberately presents the same torch.cuda API as NVIDIA.
+        torch.manual_seed(51)
+        cpu = SpliceMamba(d_model=64, d_state=16, n_layers=1,
+                          dropout=0.0, joint_frame_auxiliary=True).eval()
+        gpu = SpliceMamba(d_model=64, d_state=16, n_layers=1,
+                          dropout=0.0, joint_frame_auxiliary=True).cuda().eval()
+        gpu.load_state_dict(cpu.state_dict(), strict=True)
+        x = torch.randint(0, 5, (2, 1091))
+        with torch.inference_mode():
+            for reference, actual in zip(cpu(x, return_joint_frame=True), gpu(x.cuda(), return_joint_frame=True)):
+                torch.testing.assert_close(actual.cpu(), reference, rtol=3e-4, atol=3e-4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
     def test_cuda_forward_matches_original_triton_model(self):
+        if torch.version.hip is not None:
+            self.skipTest("upstream training kernels require NVIDIA CUDA")
         if not importlib.util.find_spec("mamba_ssm"):
             self.skipTest("optional Mamba3 training package absent")
         if torch.cuda.get_device_capability()[0] < 9:
@@ -252,11 +285,20 @@ assert "mamba_ssm" not in sys.modules
         portable = SpliceMamba(d_model=64, d_state=16, n_layers=1,
                                dropout=0.0).cuda().eval()
         portable.load_state_dict(training.state_dict(), strict=True)
+        cpu = SpliceMamba(d_model=64, d_state=16, n_layers=1,
+                          dropout=0.0).eval()
+        cpu.load_state_dict(portable.state_dict(), strict=True)
         for length in (64, 65, 256):
             with self.subTest(length=length), torch.inference_mode():
                 x = torch.randint(0, 5, (2, length), device="cuda")
-                for expected, actual in zip(training(x), portable(x)):
-                    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+                fused, actual, reference = training(x), portable(x), cpu(x.cpu())
+                for expected, output, cpu_output in zip(fused, actual, reference):
+                    torch.testing.assert_close(output.cpu(), cpu_output, rtol=2e-4, atol=2e-5)
+                    # The pinned wrapper forces BF16 scan inputs/intermediates;
+                    # the portable scan accumulates in FP32. Bound probability
+                    # and RMS logit error without demanding identical arithmetic.
+                    self.assertLess((output.softmax(-1) - expected.softmax(-1)).abs().max().item(), 1e-3)
+                    self.assertLess((output - expected).square().mean().sqrt().item(), 1e-3)
 
     @unittest.skipUnless(torch.backends.mps.is_available(), "MPS unavailable")
     def test_mps_forward_matches_cpu(self):

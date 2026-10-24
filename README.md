@@ -54,11 +54,16 @@ Use Python 3.10–3.12. On Apple Silicon:
 python -m pip install -e .
 ```
 
+Inference supports PyTorch 2.6 and newer 2.x builds. Install the appropriate
+CPU, CUDA or ROCm PyTorch build first; installing this package preserves a
+compatible existing build. The recorded research training environment remains
+pinned to PyTorch 2.6.0 in `environment.yml` and the `train` extra.
+
 On a Linux CPU-only node, install the CPU PyTorch wheel first to avoid
 downloading CUDA runtime packages:
 
 ```bash
-python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install 'torch>=2.6,<3' --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e .
 ```
 
@@ -77,8 +82,11 @@ execution. The phase, joint-frame and gated-phase scoring modules accept
 the same option. CPU defaults to batch size 1; CUDA and MPS calculate a batch
 once at startup from hardware memory capacity and model/window dimensions.
 `--batch-size 4` overrides it, and `--batch-size auto` also enables the capacity
-calculation on CPU. On HPC, set `OMP_NUM_THREADS` to the CPU allocation and benchmark the
-thread count; more threads need not improve small matrix operations.
+calculation on CPU. `--threads` overrides the thread count; existing
+`OMP_NUM_THREADS`/`MKL_NUM_THREADS` settings are respected. Otherwise CPU
+inference uses at most eight threads (four on Mac), respecting CPU affinity
+and `SLURM_CPUS_PER_TASK`. Accelerator inference defaults to one host thread.
+More threads need not improve small matrix operations.
 
 Batch selection uses total CUDA VRAM, CPU RAM, or the Mac's shared RAM capped
 by Metal's recommended working-set capacity. It performs no live memory
@@ -115,9 +123,21 @@ checkpoint loading and scoring always use PyTorch.
 
 The PyTorch implementation preserves Mamba3's SISO recurrence, trapezoidal
 discretization, partial rotary embedding, normalization and gates. It processes
-64-base blocks with bounded scan scratch space rather than allocating a
-sequence-length-squared attention matrix. Small floating-point differences
-from fused kernels are expected. The published 8-layer, bidirectional
+groups of 64-base tiles. Local tiles use batched matrix operations;
+state propagation uses batched matrices on GPU and a parallel associative scan
+on CPU. CUDA grouping is a fixed function of batch size and head count: the
+published model uses 64/16/4 tiles for batches 1/4/16, respectively. CPU uses
+up to 16 tiles and MPS uses 16. For a 10 kb window, batch-1 CUDA inference
+therefore needs three outer iterations per direction rather than 157.
+No timing probes or memory monitors are used to choose the grouping. Tile width is an
+execution detail: the state still propagates across the entire input window.
+Scratch space stays bounded by the group size rather than a
+sequence-length-squared attention matrix. Floating-point differences
+from fused kernels are expected. The pinned upstream SISO wrapper casts scan
+inputs and intermediate tensors to BF16 even with FP32 model parameters;
+portable inference accumulates the scan in FP32. Checkpoint and forward API
+compatibility therefore do not imply identical scores from both backends.
+The published 8-layer, bidirectional
 192-channel model has about 4.52 million parameters (18 MB in FP32); working
 RAM also includes activations, the input batch and the PyTorch runtime.
 Whole-genome inference still requires many overlapping 10 kb windows.
@@ -134,7 +154,14 @@ python scripts/benchmark_inference.py \
   --device cpu --batch-size 1 --threads 1
 ```
 
-Run `python scripts/smoke_model.py` for a CPU inference check, and
+On an AMD GPU supported by the installed ROCm PyTorch build, use the same
+`--device cuda` option: [PyTorch HIP deliberately reuses the CUDA API](https://docs.pytorch.org/docs/stable/notes/hip.html).
+The portable inference path imports no NVIDIA-specific Mamba kernels. An AMD
+GPU driver alone does not provide a ROCm PyTorch runtime; use CPU inference
+when that runtime or hardware support is unavailable.
+
+Run `python scripts/smoke_model.py --inference-only` for portable CPU and
+available CUDA/ROCm/MPS checks without importing training packages, and
 `python -m unittest discover -s tests -v` for recurrence, checkpoint and CLI
 tests. CUDA/Triton parity and MPS parity tests run when their hardware is
 available; CPU tests alone do not establish accelerator parity or speed.

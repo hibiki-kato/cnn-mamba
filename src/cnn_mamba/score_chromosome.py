@@ -16,7 +16,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, resolve_device
+from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
 
 ENCODE = np.full(256, 4, dtype=np.uint8)
 for _base, _value in (("A", 0), ("C", 1), ("G", 2), ("T", 3)):
@@ -94,6 +94,7 @@ def main() -> None:
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
+    configure_threads(args.threads, device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     window = int(checkpoint["config"]["window_size"])
     stride = int(checkpoint["config"]["stride"])
@@ -156,7 +157,7 @@ def main() -> None:
         for array in arrays[name].values():
             array.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "batch_size": batch_size,
+        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(), "batch_size": batch_size,
         "schema": "droso_chrx_all_candidate_scores_v1", "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_step": checkpoint.get("optimizer_step"),
         "checkpoint_epoch": checkpoint.get("epoch"),
