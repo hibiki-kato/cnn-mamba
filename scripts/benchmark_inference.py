@@ -37,6 +37,8 @@ def main():
     device = resolve_device(args.device)
     saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = model_from_checkpoint(saved, device).eval()
+    if args.compile_scan:
+        model.enable_compiled_scan()
     scan_layers = [layer for layer in model.modules() if isinstance(layer, Mamba3Torch)]
     if args.scan_chunks_per_group is not None:
         if args.scan_chunks_per_group < 1:
@@ -64,8 +66,10 @@ def main():
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     with torch.inference_mode(), inference_precision(args.precision, device):
-        model(sequence, **extra_outputs)  # warm up
+        startup = time.perf_counter()
+        model(sequence, **extra_outputs)  # warm up, including optional compilation
         synchronize()
+        warmup_seconds = time.perf_counter() - startup
         for _ in range(args.repeats):
             started = time.perf_counter()
             outputs = model(sequence, **extra_outputs)
@@ -81,7 +85,7 @@ def main():
         "checkpoint": str(args.checkpoint), "checkpoint_sha256": digest.hexdigest(),
         "torch": torch.__version__, "python": platform.python_version(),
         "platform": platform.platform(), "device": str(device), "backend": model.backend,
-        "precision": args.precision,
+        "precision": args.precision, "compile_scan": args.compile_scan,
         "accelerator_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "cuda_runtime": torch.version.cuda, "hip_runtime": torch.version.hip,
         "threads": args.threads, "batch_size": args.batch_size,
@@ -97,6 +101,7 @@ def main():
         ),
         "window_size": length, "stride": saved["config"].get("stride"),
         "parameters": sum(p.numel() for p in model.parameters()),
+        "warmup_seconds": warmup_seconds,
         "seconds_per_batch": timings, "median_seconds_per_batch": statistics.median(timings),
         "process_peak_rss_mib": peak_mib,
         "memory_scope": "whole process including Python, PyTorch, checkpoint and activations; excludes device VRAM",

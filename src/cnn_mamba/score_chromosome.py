@@ -90,7 +90,7 @@ def main() -> None:
     add_batch_arguments(parser)
     add_device_argument(parser)
     args = parser.parse_args()
-    if completed_output(args.output_dir, args.precision):
+    if completed_output(args.output_dir, args.precision, args.compile_scan):
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
@@ -100,6 +100,8 @@ def main() -> None:
     stride = int(checkpoint["config"]["stride"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model = model_from_checkpoint(checkpoint, device).eval()
+    if args.compile_scan:
+        model.enable_compiled_scan()
     batch_size = configure_batch_size(args, model, window, device)
     print(f"device={device} backend=torch batch_size={batch_size}", flush=True)
     fasta = pysam.FastaFile(str(args.fasta))
@@ -157,7 +159,7 @@ def main() -> None:
         for array in arrays[name].values():
             array.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "precision": args.precision, "threads": torch.get_num_threads(), "batch_size": batch_size,
+        "device": str(device), "backend": "torch", "precision": args.precision, "compile_scan": args.compile_scan, "threads": torch.get_num_threads(), "batch_size": batch_size,
         "schema": "droso_chrx_all_candidate_scores_v1", "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_step": checkpoint.get("optimizer_step"),
         "checkpoint_epoch": checkpoint.get("epoch"),

@@ -156,6 +156,14 @@ class SpliceMamba(nn.Module):
             nn.Linear(d_model, 4) if joint_frame_auxiliary else None
         )
 
+    def enable_compiled_scan(self):
+        """Opt into torch.compile for CUDA inference; weights/forward stay shared."""
+        if self.backend != 'torch' or next(self.parameters()).device.type != 'cuda':
+            raise ValueError('compiled scan requires the PyTorch backend on CUDA')
+        for layer in self.modules():
+            if isinstance(layer, Mamba3Torch):
+                layer.compile_scan = True
+
     def enable_bidirectional_fusion(self):
         """Enable the optional native scan fusion without changing weights/API."""
         if self.backend != 'triton':

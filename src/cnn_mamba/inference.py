@@ -106,6 +106,9 @@ def add_device_argument(parser, threads_default=None):
                         help="CPU threads; overrides OMP/MKL settings. Defaults respect job allocation.")
     parser.add_argument('--precision', choices=('fp32', 'bf16'), default='fp32',
                         help='BF16 projections/CNN with FP32 scan accumulation; scores can differ. Default: fp32.')
+    parser.add_argument('--compile-scan', action='store_true',
+                        help='Opt into torch.compile for CUDA scan operations. Adds initial compilation time; '
+                             'scores can differ slightly. Default: eager PyTorch.')
 
 
 def inference_precision(precision, device):
@@ -115,14 +118,17 @@ def inference_precision(precision, device):
     return torch.autocast(device.type, dtype=torch.bfloat16, enabled=precision == 'bf16')
 
 
-def completed_output(output_dir, precision):
-    """Reuse completed scores only when their numerical precision matches."""
+def completed_output(output_dir, precision, compile_scan=False):
+    """Reuse completed scores only when precision and scan execution match."""
     if not (output_dir / '.complete.json').is_file():
         return False
     metadata = json.loads((output_dir / 'metadata.json').read_text())
     previous = metadata.get('precision', 'fp32')
     if previous != precision:
         raise ValueError(f'completed output uses precision {previous}, requested {precision}; '
+                         'choose a different output directory')
+    if metadata.get('compile_scan', False) != compile_scan:
+        raise ValueError('completed output uses a different compile-scan setting; '
                          'choose a different output directory')
     return True
 

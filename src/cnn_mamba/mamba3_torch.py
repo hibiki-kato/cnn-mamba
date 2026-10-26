@@ -8,6 +8,7 @@ SISO, without output RMSNorm or streaming caches.
 """
 
 import math
+from functools import lru_cache
 
 import torch
 from torch import nn
@@ -39,8 +40,113 @@ def _rotate(x, angles):
     return torch.cat((rotated.flatten(-2), x[..., size:]), -1)
 
 
+def _scan_group(q, k, v, adt, dt, angles, q_bias, k_bias, skip, z,
+                gamma, scale, state, angle_state, chunk_size, local_noncausal):
+    """Evaluate a bounded group; also the compilation boundary on CUDA."""
+    batch, length, heads, width = v.shape
+    cuda_ops = v.device.type == "cuda"
+    blocks = (length + chunk_size - 1) // chunk_size
+    padding = blocks * chunk_size - length
+
+    def pack(value):
+        if padding:
+            value = F.pad(value, (0, 0) * (value.ndim - 2) + (0, padding))
+        return value.reshape(batch, blocks, chunk_size, *value.shape[2:])
+
+    angle_values = angles.float().tanh()
+    if angle_values.ndim == 3:
+        angle_values = angle_values.unsqueeze(2)
+    increments = pack(angle_values * math.pi * dt.unsqueeze(-1))
+    angle_sums = increments.sum(2)
+    angle_prefix = F.pad(angle_sums.cumsum(1)[:, :-1], (0, 0, 0, 0, 1, 0))
+    theta = (increments.cumsum(2) + angle_prefix.unsqueeze(2)
+             + angle_state[:, None, None]).remainder(2 * math.pi)
+    angle_state = (angle_state + angle_sums.sum(1)).remainder(2 * math.pi)
+    qb = pack(q.float() + q_bias.float())
+    kb = pack(k.float() + k_bias.float())
+    if cuda_ops:
+        # Keep heads before blocks/tokens so repeated batched matmuls do
+        # not each materialize the same permuted query/key tensors.
+        qb = qb.permute(0, 3, 1, 2, 4).contiguous()
+        kb = kb.permute(0, 3, 1, 2, 4).contiguous()
+        theta = theta.permute(0, 3, 1, 2, 4).contiguous()
+        diagonal = (qb * kb).sum(-1) * pack(gamma).permute(0, 3, 1, 2)
+        qr, kr = _rotate(qb, theta), _rotate(kb, theta)
+    else:
+        diagonal = ((qb * kb).sum(-1) * pack(gamma)).permute(0, 3, 1, 2)
+        qr = _rotate(qb, theta).permute(0, 3, 1, 2, 4)
+        kr = _rotate(kb, theta).permute(0, 3, 1, 2, 4)
+    kr = kr * pack(scale).permute(0, 3, 1, 2).unsqueeze(-1)
+    value = pack(v.float()).permute(0, 3, 1, 2, 4)
+    if cuda_ops:
+        value = value.contiguous()
+    cumulative = pack(adt).permute(0, 3, 1, 2).cumsum(-1)
+    decay = (cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2)).clamp(max=0).exp()
+    weights = (qr @ kr.transpose(-1, -2)) * decay
+    weights = weights.tril_(-1) if cuda_ops else weights.masked_fill(local_noncausal, 0)
+
+    # End-of-block state contributions; independent across all local blocks.
+    total = cumulative[..., -1]
+    weighted_k = kr * (total.unsqueeze(-1) - cumulative).exp().unsqueeze(-1)
+    block_states = weighted_k.transpose(-1, -2) @ value
+
+    # S_i = exp(A_i) S_{i-1} + U_i. A lower triangular transition
+    # matrix propagates U_j into every later block in one batched matmul.
+    prefix = total.cumsum(-1)
+    before = F.pad(prefix[..., :-1], (1, 0))
+    if v.device.type == "cpu":
+        # Avoid very skinny GEMMs on CPU BLAS. A logarithmic associative
+        # scan computes the same block prefix with vector operations.
+        completed, alpha = block_states, total.exp()
+        offset = 1
+        while offset < blocks:
+            tail = (completed[:, :, offset:]
+                    + alpha[:, :, offset:, None, None] * completed[:, :, :-offset])
+            completed = torch.cat((completed[:, :, :offset], tail), dim=2)
+            alpha = torch.cat((alpha[:, :, :offset],
+                               alpha[:, :, offset:] * alpha[:, :, :-offset]), dim=2)
+            offset *= 2
+        incoming = F.pad(completed[:, :, :-1], (0, 0, 0, 0, 1, 0))
+        incoming = incoming + before.exp()[..., None, None] * state.unsqueeze(2)
+    else:
+        transition = (before.unsqueeze(-1) - prefix.unsqueeze(-2)).clamp(max=0).exp()
+        if cuda_ops:
+            transition = transition.tril_(-1)
+        else:
+            causal = torch.ones(blocks, blocks, device=v.device, dtype=torch.bool).tril(-1)
+            transition = transition.masked_fill(~causal, 0)
+        incoming = transition @ block_states.flatten(-2)
+        if cuda_ops:
+            incoming = torch.addcmul(incoming, before.exp().unsqueeze(-1),
+                                    state.flatten(-2).unsqueeze(-2))
+        else:
+            incoming = incoming + before.exp().unsqueeze(-1) * state.flatten(-2).unsqueeze(-2)
+        incoming = incoming.reshape_as(block_states)
+
+    if cuda_ops:
+        out = torch.addcmul(weights @ value, qr @ incoming, cumulative.exp().unsqueeze(-1))
+        out = torch.addcmul(out, (diagonal + skip.float()[None, :, None, None]).unsqueeze(-1), value)
+    else:
+        out = (qr @ incoming) * cumulative.exp().unsqueeze(-1) + weights @ value
+        out = out + (diagonal + skip.float()[None, :, None, None]).unsqueeze(-1) * value
+    out = out * F.silu(pack(z.float()).permute(0, 3, 1, 2, 4))
+    out = out.permute(0, 2, 3, 1, 4).reshape(batch, blocks * chunk_size, heads, width)
+    if cuda_ops:
+        state = torch.addcmul(block_states[:, :, -1], incoming[:, :, -1],
+                             total[:, :, -1, None, None].exp())
+    else:
+        state = incoming[:, :, -1] * total[:, :, -1, None, None].exp() + block_states[:, :, -1]
+    return out[:, :length].to(v.dtype), state, angle_state
+
+
+@lru_cache(maxsize=1)
+def _compiled_scan_group():
+    # Lazy: CPU/MPS and the default eager path never invoke a compiler.
+    return torch.compile(_scan_group, fullgraph=True, dynamic=False)
+
+
 def siso_scan(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z,
-              chunk_size=64, chunks_per_group=16):
+              chunk_size=64, chunks_per_group=16, *, compile_scan=False):
     """Mamba3 scan with batched local blocks and parallel block-state propagation.
 
     All tensor arithmetic stays on the input device. The Python loop handles
@@ -51,6 +157,8 @@ def siso_scan(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z,
     """
     if chunk_size < 1 or chunks_per_group < 1:
         raise ValueError("chunk_size and chunks_per_group must be positive")
+    if compile_scan and (v.device.type != "cuda" or torch.is_grad_enabled()):
+        raise ValueError("compiled scan requires CUDA inference with gradients disabled")
     batch, length, heads, width = v.shape
     if length == 0:
         return v
@@ -70,89 +178,15 @@ def siso_scan(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z,
     ).triu()
     outputs = []
     group_size = chunk_size * chunks_per_group
+    group = _compiled_scan_group() if compile_scan else _scan_group
     for start in range(0, length, group_size):
         end = min(start + group_size, length)
-        blocks = (end - start + chunk_size - 1) // chunk_size
-        padding = blocks * chunk_size - (end - start)
-
-        def pack(value):
-            if padding:
-                value = F.pad(value, (0, 0) * (value.ndim - 2) + (0, padding))
-            return value.reshape(batch, blocks, chunk_size, *value.shape[2:])
-
-        angle_values = angles[:, start:end].float().tanh()
-        if angle_values.ndim == 3:
-            angle_values = angle_values.unsqueeze(2)
-        increments = pack(angle_values * math.pi * dt[:, start:end].unsqueeze(-1))
-        angle_sums = increments.sum(2)
-        angle_prefix = F.pad(angle_sums.cumsum(1)[:, :-1], (0, 0, 0, 0, 1, 0))
-        theta = (increments.cumsum(2) + angle_prefix.unsqueeze(2)
-                 + angle_state[:, None, None]).remainder(2 * math.pi)
-        angle_state = (angle_state + angle_sums.sum(1)).remainder(2 * math.pi)
-        qb = pack(q[:, start:end].float() + q_bias.float())
-        kb = pack(k[:, start:end].float() + k_bias.float())
-        diagonal = ((qb * kb).sum(-1) * pack(gamma[:, start:end])).permute(0, 3, 1, 2)
-        qr = _rotate(qb, theta).permute(0, 3, 1, 2, 4)
-        kr = _rotate(kb, theta).permute(0, 3, 1, 2, 4)
-        kr = kr * pack(scale[:, start:end]).permute(0, 3, 1, 2).unsqueeze(-1)
-        value = pack(v[:, start:end].float()).permute(0, 3, 1, 2, 4)
-        cumulative = pack(adt[:, start:end]).permute(0, 3, 1, 2).cumsum(-1)
-        decay = (cumulative.unsqueeze(-1) - cumulative.unsqueeze(-2)).clamp(max=0).exp()
-        weights = (qr @ kr.transpose(-1, -2)) * decay
-        weights = weights.tril_(-1) if cuda_ops else weights.masked_fill(local_noncausal, 0)
-
-        # End-of-block state contributions; independent across all local blocks.
-        total = cumulative[..., -1]
-        weighted_k = kr * (total.unsqueeze(-1) - cumulative).exp().unsqueeze(-1)
-        block_states = weighted_k.transpose(-1, -2) @ value
-
-        # S_i = exp(A_i) S_{i-1} + U_i. A lower triangular transition
-        # matrix propagates U_j into every later block in one batched matmul.
-        prefix = total.cumsum(-1)
-        before = F.pad(prefix[..., :-1], (1, 0))
-        if v.device.type == "cpu":
-            # Avoid very skinny GEMMs on CPU BLAS. A logarithmic associative
-            # scan computes the same block prefix with vector operations.
-            completed, alpha = block_states, total.exp()
-            offset = 1
-            while offset < blocks:
-                tail = (completed[:, :, offset:]
-                        + alpha[:, :, offset:, None, None] * completed[:, :, :-offset])
-                completed = torch.cat((completed[:, :, :offset], tail), dim=2)
-                alpha = torch.cat((alpha[:, :, :offset],
-                                   alpha[:, :, offset:] * alpha[:, :, :-offset]), dim=2)
-                offset *= 2
-            incoming = F.pad(completed[:, :, :-1], (0, 0, 0, 0, 1, 0))
-            incoming = incoming + before.exp()[..., None, None] * state.unsqueeze(2)
-        else:
-            transition = (before.unsqueeze(-1) - prefix.unsqueeze(-2)).clamp(max=0).exp()
-            if cuda_ops:
-                transition = transition.tril_(-1)
-            else:
-                causal = torch.ones(blocks, blocks, device=v.device, dtype=torch.bool).tril(-1)
-                transition = transition.masked_fill(~causal, 0)
-            incoming = transition @ block_states.flatten(-2)
-            if cuda_ops:
-                incoming = torch.addcmul(incoming, before.exp().unsqueeze(-1),
-                                        state.flatten(-2).unsqueeze(-2))
-            else:
-                incoming = incoming + before.exp().unsqueeze(-1) * state.flatten(-2).unsqueeze(-2)
-            incoming = incoming.reshape_as(block_states)
-
-        if cuda_ops:
-            out = torch.addcmul(weights @ value, qr @ incoming, cumulative.exp().unsqueeze(-1))
-            out = torch.addcmul(out, (diagonal + skip.float()[None, :, None, None]).unsqueeze(-1), value)
-        else:
-            out = (qr @ incoming) * cumulative.exp().unsqueeze(-1) + weights @ value
-            out = out + (diagonal + skip.float()[None, :, None, None]).unsqueeze(-1) * value
-        out = out * F.silu(pack(z[:, start:end].float()).permute(0, 3, 1, 2, 4))
-        out = out.permute(0, 2, 3, 1, 4).reshape(batch, blocks * chunk_size, heads, width)
-        outputs.append(out[:, :end-start].to(v.dtype))
-        if cuda_ops:
-            state = torch.addcmul(block_states[:, :, -1], incoming[:, :, -1],
-                                 total[:, :, -1, None, None].exp())
-        else:
-            state = incoming[:, :, -1] * total[:, :, -1, None, None].exp() + block_states[:, :, -1]
+        out, state, angle_state = group(
+            q[:, start:end], k[:, start:end], v[:, start:end], adt[:, start:end],
+            dt[:, start:end], angles[:, start:end],
+            q_bias, k_bias, skip, z[:, start:end], gamma[:, start:end],
+            scale[:, start:end], state, angle_state, chunk_size, local_noncausal)
+        outputs.append(out)
     return torch.cat(outputs, dim=1)
 
 
@@ -168,6 +202,7 @@ class Mamba3Torch(nn.Module):
         self.d_inner = 2 * d_model
         self.chunk_size = chunk_size
         self.chunks_per_group = chunks_per_group
+        self.compile_scan = False
         if self.d_inner % headdim:
             raise ValueError("2 * d_model must be divisible by headdim")
         self.nheads = self.d_inner // headdim
@@ -218,10 +253,13 @@ class Mamba3Torch(nn.Module):
                 self.C_bias.squeeze(1), self.B_bias.squeeze(1), self.D, z)
 
     def forward(self, u):
+        if self.compile_scan and self.training:
+            raise ValueError("compiled scan requires eval() inference")
         batch, length, _ = u.shape
         values = self.prepare(self.in_proj(u))
         # Outer autocast may use BF16 for projections, but recurrent state and
         # scan matrix operations retain FP32 accumulation on every device.
         with torch.autocast(u.device.type, enabled=False):
-            y = siso_scan(*values, self.chunk_size, self.scan_group_size(batch, u.device))
+            y = siso_scan(*values, self.chunk_size, self.scan_group_size(batch, u.device),
+                          compile_scan=self.compile_scan)
         return self.out_proj(y.reshape(batch, length, self.d_inner))

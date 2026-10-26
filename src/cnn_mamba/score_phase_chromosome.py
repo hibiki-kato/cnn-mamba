@@ -33,7 +33,7 @@ def main():
     args = parser.parse_args()
 
     sentinel = args.output_dir / ".complete.json"
-    if completed_output(args.output_dir, args.precision):
+    if completed_output(args.output_dir, args.precision, args.compile_scan):
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
@@ -63,6 +63,8 @@ def main():
     )
 
     model = model_from_checkpoint(checkpoint, device).eval()
+    if args.compile_scan:
+        model.enable_compiled_scan()
     args.batch_size = configure_batch_size(args, model, window, device)
     print(f"device={device} backend=torch batch_size={args.batch_size}", flush=True)
     started = time.time()
@@ -112,7 +114,7 @@ def main():
     probabilities.flush()
     argmax.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "precision": args.precision, "threads": torch.get_num_threads(), "batch_size": args.batch_size,
+        "device": str(device), "backend": "torch", "precision": args.precision, "compile_scan": args.compile_scan, "threads": torch.get_num_threads(), "batch_size": args.batch_size,
         "schema": "per_base_phase_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),

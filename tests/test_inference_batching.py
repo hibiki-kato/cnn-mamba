@@ -22,6 +22,12 @@ class BatchTests(unittest.TestCase):
             self.assertTrue(completed_output(root, 'fp32'))
             with self.assertRaisesRegex(ValueError, 'different output directory'):
                 completed_output(root, 'bf16')
+            with self.assertRaisesRegex(ValueError, 'compile-scan'):
+                completed_output(root, 'fp32', compile_scan=True)
+            (root/'metadata.json').write_text(json.dumps({'precision': 'fp32', 'compile_scan': True}))
+            self.assertTrue(completed_output(root, 'fp32', compile_scan=True))
+            with self.assertRaisesRegex(ValueError, 'compile-scan'):
+                completed_output(root, 'fp32')
 
     def setUp(self):
         self.parser = argparse.ArgumentParser()

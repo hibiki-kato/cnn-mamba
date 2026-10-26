@@ -59,6 +59,40 @@ def recurrent_reference(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z)
 
 
 class TorchInferenceTests(unittest.TestCase):
+    def test_compilation_is_optional_and_cuda_inference_only(self):
+        model = SpliceMamba(d_model=16, d_state=8, n_layers=1).eval()
+        with self.assertRaisesRegex(ValueError, 'CUDA'):
+            model.enable_compiled_scan()
+        with patch('torch.compile', side_effect=AssertionError('eager inference must not compile')):
+            with torch.inference_mode():
+                model(torch.zeros(1, 65, dtype=torch.long))
+        layer = Mamba3Torch(16, 8, 16)
+        layer.compile_scan = True
+        with self.assertRaisesRegex(ValueError, 'eval'):
+            layer(torch.zeros(1, 65, 16))
+        layer.eval()
+        with torch.inference_mode(), self.assertRaisesRegex(ValueError, 'CUDA'):
+            layer(torch.zeros(1, 65, 16))
+
+    @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip is None, 'NVIDIA CUDA unavailable')
+    def test_compiled_scan_matches_independent_recurrence_with_group_and_padding_boundaries(self):
+        torch.manual_seed(1251)
+        for length in (1, 65, 129):
+            batch, heads, width, state = 2, 3, 4, 8
+            q = torch.randn(batch, length, 1, state)
+            k = torch.randn_like(q)
+            v = torch.randn(batch, length, heads, width)
+            dt = torch.rand(batch, length, heads) * 0.5 + 0.01
+            args = (q, k, v, -torch.rand_like(dt) * dt, dt,
+                    torch.randn_like(dt), torch.randn(batch, length, state // 4),
+                    torch.randn(heads, state), torch.randn(heads, state),
+                    torch.randn(heads), torch.randn_like(v))
+            expected = recurrent_reference(*args)
+            with torch.inference_mode():
+                actual = siso_scan(*(v.cuda() for v in args), chunk_size=16,
+                                   chunks_per_group=4, compile_scan=True)
+            torch.testing.assert_close(actual.cpu().double(), expected, rtol=3e-5, atol=3e-5)
+
     def test_bf16_autocast_preserves_fp32_scan_context_and_checkpoint(self):
         model = SpliceMamba(d_model=64, d_state=16, n_layers=1, dropout=0.0).eval()
         keys = tuple(model.state_dict())

@@ -96,6 +96,19 @@ scores from a different precision are not reused. Measure it on the target hardw
 improved modestly, and M4 MPS with PyTorch 2.6.0 did not improve. FP16 inference
 is not offered because the published checkpoint produced non-finite outputs.
 
+`--compile-scan` opts into `torch.compile` for CUDA inference. It compiles a
+bounded group of scan operations, fusing elementwise work and reducing
+intermediate tensor traffic. The first use of a new shape adds compilation
+time and requires a working PyTorch CUDA compilation toolchain. On CUDA,
+PyTorch's compiler generates Triton kernels itself; the model still contains
+only PyTorch operations and does not import the native Mamba training package.
+CPU/MPS use eager PyTorch; requesting this option there raises an error.
+Compilation keeps the same architecture, checkpoint and forward interface,
+but can change floating-point results slightly. It is off by default. Use a
+new output directory when switching this option; metadata records the choice.
+Programmatic callers can use `model.enable_compiled_scan()` after loading the
+PyTorch model onto CUDA, then call `eval()` and use `torch.inference_mode()`.
+
 Batch selection uses total CUDA VRAM, CPU RAM, or the Mac's shared RAM capped
 by Metal's recommended working-set capacity. It performs no live memory
 monitoring, trial forwards, or runtime batch resizing. `--memory-fraction`
