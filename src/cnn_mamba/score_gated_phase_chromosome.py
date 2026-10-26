@@ -13,6 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
+from .inference import add_device_argument, configure_threads, resolve_device, resolve_batch_size
 from .score_chromosome import encode, keep_bounds
 
 
@@ -23,7 +24,7 @@ def main():
     parser.add_argument("--chrom", required=True)
     parser.add_argument("--display-chrom", default="chrX")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument(
         "--write-raw-phase", action="store_true",
         help="Also persist the ungated phase softmax for direct comparison.",
@@ -32,13 +33,15 @@ def main():
         "--reference-phase-probabilities", type=Path,
         help="Optional original raw phase array used to prove the frozen model is unchanged.",
     )
+    add_device_argument(parser)
     args = parser.parse_args()
     sentinel = args.output_dir / ".complete.json"
     if sentinel.is_file():
         print(f"already complete: {args.output_dir}", flush=True)
         return
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required")
+    device = resolve_device(args.device)
+    configure_threads(args.threads, device)
+    args.batch_size = resolve_batch_size(args.batch_size, device, 8)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
@@ -86,8 +89,7 @@ def main():
                 f"reference phase shape {reference.shape} != {(chrom_len, 3)}"
             )
 
-    device = torch.device("cuda")
-    model = model_from_checkpoint(checkpoint, device).eval()
+    model = model_from_checkpoint(checkpoint, device, backend="torch").eval()
     expected_position = 0
     max_phase_difference = 0.0
     started = time.time()
@@ -150,6 +152,7 @@ def main():
         raw_phase.flush()
     joint_argmax.flush()
     metadata = {
+        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(),
         "schema": "cds_gated_phase_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint["epoch"]),

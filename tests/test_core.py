@@ -1,14 +1,23 @@
+import importlib
+import importlib.util
+import json
+import subprocess
+import sys
+from unittest.mock import patch
+
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 import torch
+import pysam
 
 from cnn_mamba.common import splice_candidate_masks, start_stop_candidate_masks
 from cnn_mamba.evaluate_gated_phase import BinnedBinaryMetrics
 from cnn_mamba.prepare_human import parse_cds_phase_records as parse_human_phase
-from cnn_mamba.model import SpliceMamba
+from cnn_mamba.model import SpliceMamba, model_from_checkpoint
+from cnn_mamba.mamba3_torch import siso_scan
 from cnn_mamba.mlm_pretrain import CNNMambaMLM, corrupt_for_mlm
 from cnn_mamba.prepare_droso import (
     build_cds_boundary_mask, build_cds_track, build_phase_track,
@@ -327,6 +336,150 @@ class CoreTests(unittest.TestCase):
             row = parse_stats(path)
         self.assertEqual(row["f1"], 77.41935483870968)
         self.assertEqual(row["predicted_loci"], 90)
+
+
+def _recurrent_reference(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z):
+    """Independent, per-token float64 trapezoidal recurrence with complex RoPE.
+
+    S_t = exp(ADT_t) (S_{t-1} + dt_t (1-trap_t) K_{t-1} V_{t-1})
+          + dt_t trap_t K_t V_t; y_t = (Q_t S_t + D V_t) silu(Z_t).
+    """
+    q, k = q.double() + q_bias.double(), k.double() + k_bias.double()
+    v, dt, adt, trap = v.double(), dt.double(), adt.double(), trap.double().sigmoid()
+    batch, length, heads, width = v.shape
+    state = torch.zeros(batch, heads, k.shape[-1], width, dtype=torch.float64)
+    theta = torch.zeros(batch, heads, angles.shape[-1], dtype=torch.float64)
+    previous = torch.zeros_like(state)
+    outputs = []
+    for t in range(length):
+        increment = angles[:, t].double().tanh()
+        if increment.ndim == 2:
+            increment = increment.unsqueeze(1)
+        theta = theta + increment * np.pi * dt[:, t, :, None]
+        rotation = torch.polar(torch.ones_like(theta), theta)
+
+        def rotate(value):
+            n = 2 * theta.shape[-1]
+            pairs = torch.view_as_complex(value[..., :n].reshape(batch, heads, -1, 2).contiguous())
+            return torch.cat((torch.view_as_real(pairs * rotation).flatten(-2), value[..., n:]), -1)
+
+        qt, kt = rotate(q[:, t]), rotate(k[:, t])
+        current = kt.unsqueeze(-1) * v[:, t].unsqueeze(-2)
+        gamma = dt[:, t] * trap[:, t]
+        beta = dt[:, t] * (1 - trap[:, t])
+        state = adt[:, t, :, None, None].exp() * (
+            state + beta[..., None, None] * previous
+        ) + gamma[..., None, None] * current
+        value = (qt.unsqueeze(-1) * state).sum(-2) + skip.double()[None, :, None] * v[:, t]
+        outputs.append(value * torch.nn.functional.silu(z[:, t].double()))
+        previous = current
+    return torch.stack(outputs, 1)
+
+class PortableInferenceTests(unittest.TestCase):
+    def test_scan_matches_independent_float64_recurrence(self):
+        torch.manual_seed(123)
+        for length in (1, 65, 129, 1025):
+            q = torch.randn(1, length, 1, 8)
+            v = torch.randn(1, length, 2, 4)
+            dt = torch.rand(1, length, 2) * 0.5 + 0.01
+            args = (q, torch.randn_like(q), v, -torch.rand_like(dt) * dt, dt,
+                    torch.randn_like(dt), torch.randn(1, length, 2),
+                    torch.randn(2, 8), torch.randn(2, 8), torch.randn(2), torch.randn_like(v))
+            expected = _recurrent_reference(*args)
+            for group in (1, 4, 16):
+                with self.subTest(length=length, group=group):
+                    actual = siso_scan(*args, chunks_per_group=group)
+                    torch.testing.assert_close(actual.double(), expected, rtol=3e-5, atol=2e-5)
+
+    def test_checkpoint_roundtrip_preserves_both_architectures(self):
+        for architecture in ("cnn_mamba", "mamba"):
+            config = dict(d_model=16, d_state=8, n_layers=1, dropout=0., architecture=architecture)
+            model = SpliceMamba(**config, backend="torch").eval()
+            restored = model_from_checkpoint(dict(config=config, model_state_dict=model.state_dict()), "cpu", backend="torch").eval()
+            self.assertEqual(restored.backend, "torch")
+            self.assertEqual(tuple(restored.state_dict()), tuple(model.state_dict()))
+            sequence = torch.randint(0, 5, (2, 129))
+            with torch.inference_mode():
+                for before, after in zip(model(sequence), restored(sequence)):
+                    torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+    @unittest.skipUnless(importlib.util.find_spec("mamba_ssm"), "optional native training package absent")
+    def test_native_training_default_and_checkpoint_keys_are_preserved(self):
+        native = SpliceMamba(d_model=64, d_state=16, n_layers=1)
+        portable = SpliceMamba(d_model=64, d_state=16, n_layers=1, backend="torch")
+        self.assertEqual(native.backend, "triton")
+        saved = dict(config=dict(d_model=64, d_state=16, n_layers=1), model_state_dict=native.state_dict())
+        self.assertEqual(model_from_checkpoint(saved, "cpu").backend, "triton")
+        portable.load_state_dict(native.state_dict(), strict=True)
+        native.load_state_dict(portable.state_dict(), strict=True)
+
+    def test_inference_does_not_import_native_dependencies(self):
+        code = '''
+import importlib.abc
+import sys
+import torch
+class RejectNative(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, *args):
+        if fullname.split('.')[0] in {'mamba_ssm', 'triton', 'causal_conv1d'}:
+            raise AssertionError('inference imported ' + fullname)
+sys.meta_path.insert(0, RejectNative())
+from cnn_mamba.model import SpliceMamba, model_from_checkpoint
+config = dict(d_model=16, d_state=8, n_layers=1)
+model = SpliceMamba(**config, backend='torch')
+model = model_from_checkpoint(dict(config=config, model_state_dict=model.state_dict()), 'cpu', backend='torch').eval()
+with torch.inference_mode():
+    assert all(y.isfinite().all() for y in model(torch.zeros(1, 65, dtype=torch.long)))
+'''
+        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+    def test_all_four_cpu_scorers_preserve_formats_and_batch_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            text = "ATGGTAGTAATGCGTAG" * 9 + "NNN"
+            fasta = root / "tiny.fa"
+            fasta.write_text(">tiny\n" + text + "\n")
+            pysam.faidx(str(fasta))
+            model = SpliceMamba(d_model=16, d_state=8, n_layers=1, backend="torch",
+                                phase_auxiliary=True, cds_auxiliary=True, joint_frame_auxiliary=True)
+            checkpoint = root / "model.pt"
+            torch.save(dict(model_state_dict=model.state_dict(), epoch=1,
+                            config=dict(d_model=16, d_state=8, n_layers=1, window_size=64,
+                                        stride=32, phase_aux_weight=0.1)), checkpoint)
+            for name in ("score_chromosome", "score_phase_chromosome",
+                         "score_joint_frame_chromosome", "score_gated_phase_chromosome"):
+                module = importlib.import_module("cnn_mamba." + name)
+                destinations = []
+                for batch in (None, 2):
+                    destination = root / f"{name}_{batch}"
+                    argv = [name, "--checkpoint", str(checkpoint), "--fasta", str(fasta),
+                            "--chrom", "tiny", "--output-dir", str(destination),
+                            "--device", "cpu", "--threads", "1"]
+                    if batch is not None:
+                        argv += ["--batch-size", str(batch)]
+                    with patch.object(sys, "argv", argv):
+                        module.main()
+                    metadata = json.loads((destination / "metadata.json").read_text())
+                    self.assertEqual(metadata["backend"], "torch")
+                    self.assertEqual(metadata["device"], "cpu")
+                    self.assertTrue((destination / ".complete.json").is_file())
+                    for path in destination.glob("*.npy"):
+                        self.assertTrue(np.isfinite(np.load(path)).all())
+                    destinations.append(destination)
+                for path in destinations[0].glob("*.npy"):
+                    np.testing.assert_allclose(np.load(destinations[1] / path.name), np.load(path), rtol=2e-5, atol=2e-6)
+                if name == "score_chromosome":
+                    expected = [i for i in range(len(text)-1) if text[i:i+2] == "GT"]
+                    self.assertEqual(np.load(destinations[0]/"donor_positions0.npy").tolist(), expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_portable_cuda_matches_cpu(self):
+        model = SpliceMamba(d_model=64, d_state=16, n_layers=1, backend="torch", dropout=0.).eval()
+        saved = dict(config=dict(d_model=64, d_state=16, n_layers=1, dropout=0.), model_state_dict=model.state_dict())
+        accelerator = model_from_checkpoint(saved, "cuda", backend="torch").eval()
+        sequence = torch.randint(0, 5, (2, 129))
+        with torch.inference_mode():
+            for expected, actual in zip(model(sequence), accelerator(sequence.cuda())):
+                torch.testing.assert_close(actual.cpu(), expected, rtol=2e-4, atol=2e-5)
 
 
 if __name__ == "__main__":

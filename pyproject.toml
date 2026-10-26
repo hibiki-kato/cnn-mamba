@@ -13,6 +13,11 @@ dependencies = [
   "matplotlib==3.10.8",
   "pysam==0.23.3",
   "scikit-learn==1.7.2",
+  "torch>=2.6,<3",
+]
+
+[project.optional-dependencies]
+train = [
   "torch==2.6.0",
   "mamba-ssm @ git+https://github.com/state-spaces/mamba.git@be0303b971cd79a4fbbcfc411a01b33f6b0e3602",
   "causal-conv1d==1.6.1",

@@ -44,6 +44,40 @@ PR--Sn curves, EviAnn operating points and strict locus results.
 
 ## 1. Install
 
+### Portable inference
+
+Standalone scoring uses PyTorch on CPU, Apple MPS and CUDA, without the native
+Mamba training package. Use Python 3.10–3.12 and PyTorch 2.6 or newer 2.x.
+On a CPU-only node, install the CPU wheel first:
+
+```bash
+python -m pip install 'torch>=2.6,<3' --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e .
+```
+
+On Mac or CUDA, install the appropriate PyTorch build, then `pip install -e .`.
+All four chromosome scoring commands accept `--device auto|cpu|mps|cuda` and
+`--threads`. `auto` prefers CUDA, then MPS, then CPU. CPU defaults to batch1;
+accelerators keep the previous batch defaults. `--batch-size` overrides these.
+Existing OMP/MKL and HPC thread-allocation settings are respected.
+
+```bash
+cnn-mamba-score --checkpoint /path/to/model.pt --fasta /path/to/indexed.fa \
+  --chrom NC_000001.11 --output-dir /path/to/new_scores \
+  --device cpu --threads 8 --batch-size 1
+```
+
+`model_from_checkpoint(saved, device, backend="torch")` selects PyTorch while
+preserving the architecture, checkpoint keys and forward interface. The four
+scorers select it explicitly. Model construction/checkpoint loading keep their
+native default for existing training/calibration callers. Training dependencies
+are in the `train` extra.
+Use a fresh output directory when switching from native inference: its internal
+BF16 arithmetic differs from the portable FP32 scan, so scores are not guaranteed
+identical. Regression checks are part of the existing `tests/test_core.py`.
+
+### Training environment
+
 The recorded environment used Python 3.10, PyTorch 2.6.0+cu124 and a Git build
 of Mamba at commit `be0303b971cd79a4fbbcfc411a01b33f6b0e3602`. Its package
 metadata says `mamba-ssm==2.3.1`, but the PyPI 2.3.1 source is not equivalent:
