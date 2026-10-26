@@ -12,36 +12,25 @@ def _mamba3_class(backend):
     if backend == "torch":
         return Mamba3Torch
     if backend == "triton":
-        try:
-            from mamba_ssm import Mamba3
-        except ImportError as error:
-            raise ImportError(
-                "Triton training requires the pinned Mamba3 environment; "
-                "see environment.yml. For inference use backend='torch'."
-            ) from error
+        from mamba_ssm import Mamba3
         return Mamba3
     raise ValueError(f"unsupported Mamba3 backend: {backend}")
 
 
 class BiMamba3Block(nn.Module):
-    def __init__(self, d_model: int, d_state: int, headdim: int, backend="torch"):
+    def __init__(self, d_model: int, d_state: int, headdim: int, backend="triton"):
         super().__init__()
-        self.backend = backend
-        self.fuse_directions = False
         Mamba3 = _mamba3_class(backend)
         self.fw = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim)
         self.bw = Mamba3(d_model=d_model, d_state=d_state, headdim=headdim)
 
     def forward(self, x):
-        if self.fuse_directions:
-            from .mamba3_native import fused_bidirectional
-            return fused_bidirectional(self, x)
         return self.fw(x) + self.bw(x.flip(1)).flip(1)
 
 
 class CNNBiMamba3Block(nn.Module):
     def __init__(self, d_model, d_state, headdim, dropout, kernel_size=7,
-                 backend="torch"):
+                 backend="triton"):
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 == 0:
             raise ValueError("cnn_kernel_size must be a positive odd integer")
@@ -106,7 +95,7 @@ class SpliceMamba(nn.Module):
                  architecture="cnn_mamba", cnn_kernel_size=7,
                  frame_dilation=0, phase_auxiliary=False,
                  cds_auxiliary=False, joint_frame_auxiliary=False,
-                 vocab_size=5, backend="torch"):
+                 vocab_size=5, backend="triton"):
         super().__init__()
         if architecture not in {"mamba", "cnn_mamba"}:
             raise ValueError(f"unsupported architecture: {architecture}")
@@ -156,22 +145,6 @@ class SpliceMamba(nn.Module):
             nn.Linear(d_model, 4) if joint_frame_auxiliary else None
         )
 
-    def enable_compiled_scan(self):
-        """Opt into torch.compile for CUDA inference; weights/forward stay shared."""
-        if self.backend != 'torch' or next(self.parameters()).device.type != 'cuda':
-            raise ValueError('compiled scan requires the PyTorch backend on CUDA')
-        for layer in self.modules():
-            if isinstance(layer, Mamba3Torch):
-                layer.compile_scan = True
-
-    def enable_bidirectional_fusion(self):
-        """Enable the optional native scan fusion without changing weights/API."""
-        if self.backend != 'triton':
-            raise ValueError('bidirectional fusion requires the native Triton backend')
-        for layer in self.modules():
-            if isinstance(layer, BiMamba3Block):
-                layer.fuse_directions = True
-
     def encode(self, sequence):
         """Return shared per-base features before task-specific branches."""
         x = self.embed_drop(self.input_proj(self.embedding(sequence)))
@@ -215,6 +188,7 @@ def model_from_checkpoint(saved, device=None):
     config = saved.get("config", {})
     state = saved["model_state_dict"]
     model = SpliceMamba(
+        backend="torch",
         d_model=config.get("d_model", 192), d_state=config.get("d_state", 64),
         n_layers=config.get("n_layers", 8), dropout=config.get("dropout", 0.1),
         architecture=config.get("architecture", "cnn_mamba"),

@@ -44,150 +44,38 @@ PR--Sn curves, EviAnn operating points and strict locus results.
 
 ## 1. Install
 
-### Inference on Mac or a CPU-only HPC node
+### Portable inference
 
-Inference uses pure PyTorch on every device, including CUDA. It does not
-require `mamba-ssm`, Triton, `causal-conv1d`, a CUDA toolkit, or a compiler.
-Use Python 3.10–3.12. On Apple Silicon:
-
-```bash
-python -m pip install -e .
-```
-
-Inference supports PyTorch 2.6 and newer 2.x builds. Install the appropriate
-CPU, CUDA or ROCm PyTorch build first; installing this package preserves a
-compatible existing build. The recorded research training environment remains
-pinned to PyTorch 2.6.0 in `environment.yml` and the `train` extra.
-
-On a Linux CPU-only node, install the CPU PyTorch wheel first to avoid
-downloading CUDA runtime packages:
+Standalone scoring uses PyTorch on CPU, Apple MPS and CUDA, without the native
+Mamba training package. Use Python 3.10–3.12 and PyTorch 2.6 or newer 2.x.
+On a CPU-only node, install the CPU wheel first:
 
 ```bash
 python -m pip install 'torch>=2.6,<3' --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e .
 ```
 
-The scoring interface and output formats are the same on all devices:
+On Mac or CUDA, install the appropriate PyTorch build, then `pip install -e .`.
+All four chromosome scoring commands accept `--device auto|cpu|mps|cuda` and
+`--threads`. `auto` prefers CUDA, then MPS, then CPU. CPU defaults to batch1;
+accelerators keep the previous batch defaults. `--batch-size` overrides these.
+Existing OMP/MKL and HPC thread-allocation settings are respected.
 
 ```bash
-OMP_NUM_THREADS=1 cnn-mamba-score \
-  --checkpoint models/human_joint_frame_beta010_chr1held_epoch4_inference.pt \
-  --fasta /path/to/indexed_genome.fa --chrom NC_000001.11 \
-  --output-dir /path/to/new_scores --device cpu
+cnn-mamba-score --checkpoint /path/to/model.pt --fasta /path/to/indexed.fa \
+  --chrom NC_000001.11 --output-dir /path/to/new_scores \
+  --device cpu --threads 8 --batch-size 1
 ```
 
-`--device auto` (the default) selects CUDA, then Apple MPS, then CPU. Use
-`--device cpu` on Mac for the CPU path or `--device mps` for Apple GPU
-execution. The phase, joint-frame and gated-phase scoring modules accept
-the same option. CPU defaults to batch size 1; CUDA and MPS calculate a batch
-once at startup from hardware memory capacity and model/window dimensions.
-`--batch-size 4` overrides it, and `--batch-size auto` also enables the capacity
-calculation on CPU. `--threads` overrides the thread count; existing
-`OMP_NUM_THREADS`/`MKL_NUM_THREADS` settings are respected. Otherwise CPU
-inference uses at most eight threads (four on Mac), respecting CPU affinity
-and `SLURM_CPUS_PER_TASK`. Accelerator inference defaults to one host thread.
-More threads need not improve small matrix operations.
+`model_from_checkpoint(saved, device)` selects PyTorch inference while preserving
+the architecture, checkpoint keys and forward interface. `SpliceMamba(...)`
+keeps the native backend default for existing training code; explicit callers
+can select `backend="torch"`. Training dependencies are in the `train` extra.
+Use a fresh output directory when switching from native inference: its internal
+BF16 arithmetic differs from the portable FP32 scan, so scores are not guaranteed
+identical. Regression checks are part of the existing `tests/test_core.py`.
 
-`--precision bf16` optionally uses BF16 for projections/CNN operations while
-keeping scan state and scan matrix operations in FP32. The default is `fp32`.
-Scores and close class decisions can change; this is not an accuracy-preserving
-conversion. Use a new output directory when changing precision; completed
-scores from a different precision are not reused. Measure it on the target hardware: our Ryzen 9950X benefited, CUDA
-improved modestly, and M4 MPS with PyTorch 2.6.0 did not improve. FP16 inference
-is not offered because the published checkpoint produced non-finite outputs.
-
-`--compile-scan` opts into `torch.compile` for CUDA inference. It compiles a
-bounded group of scan operations, fusing elementwise work and reducing
-intermediate tensor traffic. The first use of a new shape adds compilation
-time and requires a working PyTorch CUDA compilation toolchain. On CUDA,
-PyTorch's compiler generates Triton kernels itself; the model still contains
-only PyTorch operations and does not import the native Mamba training package.
-CPU/MPS use eager PyTorch; requesting this option there raises an error.
-Compilation keeps the same architecture, checkpoint and forward interface,
-but can change floating-point results slightly. It is off by default. Use a
-new output directory when switching this option; metadata records the choice.
-Programmatic callers can use `model.enable_compiled_scan()` after loading the
-PyTorch model onto CUDA, then call `eval()` and use `torch.inference_mode()`.
-
-Batch selection uses total CUDA VRAM, CPU RAM, or the Mac's shared RAM capped
-by Metal's recommended working-set capacity. It performs no live memory
-monitoring, trial forwards, or runtime batch resizing. `--memory-fraction`
-(default `0.5`) sets the fraction of that capacity used in the estimate;
-`--max-batch-size` (default `32`) caps the result. For a fixed HPC allocation,
-`--memory-gb 8` supplies an 8 GiB capacity directly, without querying hardware.
-The estimate is conservative, not a guarantee of peak memory or optimal speed.
-
-### Shared model and checkpoint interface
-
-Training and inference use the same `SpliceMamba`, `forward` arguments and
-`model_state_dict` keys/shapes. Published training checkpoints load directly;
-no export, conversion, or retraining is needed:
-
-```python
-import torch
-from cnn_mamba.model import SpliceMamba, model_from_checkpoint
-
-# Research training, in the CUDA training environment:
-training_model = SpliceMamba(backend="triton").to("cuda")
-
-# Deployment, using the same checkpoint and model API:
-saved = torch.load("checkpoint.pt", map_location="cpu", weights_only=False)
-model = model_from_checkpoint(saved, device="cpu").eval()
-with torch.inference_mode():
-    splice_logits, start_stop_logits = model(sequence.to("cpu"))
-```
-
-`SpliceMamba` defaults to `backend="torch"`; the training entry points
-explicitly select `backend="triton"` and retain their original optimized
-Mamba3 implementation, including validation during training. Standalone
-checkpoint loading and scoring always use PyTorch.
-
-The PyTorch implementation preserves Mamba3's SISO recurrence, trapezoidal
-discretization, partial rotary embedding, normalization and gates. It processes
-groups of 64-base tiles. Local tiles use batched matrix operations;
-state propagation uses batched matrices on GPU and a parallel associative scan
-on CPU. CUDA grouping is a fixed function of batch size and head count: the
-published model uses 64/16/4 tiles for batches 1/4/16, respectively. CPU uses
-up to 16 tiles and MPS uses 16. For a 10 kb window, batch-1 CUDA inference
-therefore needs three outer iterations per direction rather than 157.
-No timing probes or memory monitors are used to choose the grouping. Tile width is an
-execution detail: the state still propagates across the entire input window.
-Scratch space stays bounded by the group size rather than a
-sequence-length-squared attention matrix. Floating-point differences
-from fused kernels are expected. The pinned upstream SISO wrapper casts scan
-inputs and intermediate tensors to BF16 even with FP32 model parameters;
-portable inference accumulates the scan in FP32. Checkpoint and forward API
-compatibility therefore do not imply identical scores from both backends.
-The published 8-layer, bidirectional
-192-channel model has about 4.52 million parameters (18 MB in FP32); working
-RAM also includes activations, the input batch and the PyTorch runtime.
-Whole-genome inference still requires many overlapping 10 kb windows.
-Smaller models can use the same architecture and interface, but must be
-trained at those dimensions; changing checkpoint dimensions at load time
-does not shrink a trained model. Preserve its trained window geometry when
-comparing scores.
-
-Measure latency and whole-process peak RAM on the target node with:
-
-```bash
-python scripts/benchmark_inference.py \
-  --checkpoint models/human_joint_frame_beta010_chr1held_epoch4_inference.pt \
-  --device cpu --batch-size 1 --threads 1
-```
-
-On an AMD GPU supported by the installed ROCm PyTorch build, use the same
-`--device cuda` option: [PyTorch HIP deliberately reuses the CUDA API](https://docs.pytorch.org/docs/stable/notes/hip.html).
-The portable inference path imports no NVIDIA-specific Mamba kernels. An AMD
-GPU driver alone does not provide a ROCm PyTorch runtime; use CPU inference
-when that runtime or hardware support is unavailable.
-
-Run `python scripts/smoke_model.py --inference-only` for portable CPU and
-available CUDA/ROCm/MPS checks without importing training packages, and
-`python -m unittest discover -s tests -v` for recurrence, checkpoint and CLI
-tests. CUDA/Triton parity and MPS parity tests run when their hardware is
-available; CPU tests alone do not establish accelerator parity or speed.
-
-### CUDA research training
+### Training environment
 
 The recorded environment used Python 3.10, PyTorch 2.6.0+cu124 and a Git build
 of Mamba at commit `be0303b971cd79a4fbbcfc411a01b33f6b0e3602`. Its package
@@ -200,38 +88,6 @@ conda activate cnn_mamba_k7
 pip install -e . --no-deps --no-build-isolation
 python scripts/smoke_model.py
 ```
-
-Training supports optional BF16 AMP and static capacity-based microbatches:
-
-```bash
-python -m cnn_mamba.train --mode baseline --data-root /path/to/processed \
-  --batch-size auto --effective-batch-size 8 \
-  --amp --amp-dtype bfloat16 --fuse-bidirectional
-```
-
-`--batch-size auto` reads total VRAM once and estimates activation, parameter,
-gradient and optimizer memory from window/model dimensions and precision.
-It reserves headroom (`--memory-fraction 0.8` by default), supports a fixed
-allocation override with `--memory-gb`, and caps the microbatch with
-`--max-batch-size`. It performs no trial steps, live memory monitoring or OOM
-backoff. This is a conservative capacity estimate, not a guarantee of fit or
-maximum speed. Gradient checkpointing does not reduce this estimate.
-
-The selected microbatch divides `--effective-batch-size`, and accumulation is
-adjusted to preserve samples per optimizer step. Without an explicit effective
-size, auto uses the historical microbatch 4 times `--grad-accum` (8 by default).
-Manual batch/accumulation defaults remain 4 and 2. Changing microbatching still
-changes floating-point summation and dropout draws; it does not promise an
-identical training trajectory. The last partial update can also be smaller.
-
-`--amp` retains FP16 as its default; add `--amp-dtype bfloat16` for BF16, which
-uses FP32 master parameters and no active gradient scaler. The optional
-`--fuse-bidirectional` combines independent forward/backward heads in one native
-scan. It preserves parameter keys, the forward API and gradients, but uses
-additional concatenation buffers (approximately 18% more peak VRAM in our
-batch-4 test). It applies only to the native training backend; standalone
-inference continues to use the portable implementation. Existing research
-commands keep their original settings unless these options are specified.
 
 For a newer CUDA stack, install a matching PyTorch build first, then compile or
 install `causal-conv1d` and `mamba-ssm` against it. Do not assume a wheel built

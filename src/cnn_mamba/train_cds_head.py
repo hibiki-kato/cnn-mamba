@@ -58,7 +58,6 @@ class CDSDataset(Dataset):
 def make_model(base):
     config = base["config"]
     model = SpliceMamba(
-        backend="triton",
         d_model=config.get("d_model", 192),
         d_state=config.get("d_state", 64),
         n_layers=config.get("n_layers", 8),

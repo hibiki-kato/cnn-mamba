@@ -16,7 +16,6 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device
 from .temperature_scaling import (
     CLASS_ORDER, calibration_metrics, fit_temperature, joint_frame_targets,
 )
@@ -24,7 +23,7 @@ from .train import PUDataset
 
 
 def collect_sample(model, loader, device, center_left, center_right,
-                   samples_per_window, seed, amp, precision='fp32'):
+                   samples_per_window, seed, amp):
     """Uniformly sample owned center bases while performing one validation pass."""
     generator = torch.Generator().manual_seed(seed)
     sampled_logits, sampled_targets = [], []
@@ -33,8 +32,7 @@ def collect_sample(model, loader, device, center_left, center_right,
     with torch.inference_mode():
         for batch_index, batch in enumerate(loader, 1):
             sequence = batch[0].to(device, non_blocking=True)
-            with autocast(device.type, enabled=precision == 'bf16' or (amp and device.type == "cuda"),
-                          dtype=torch.bfloat16 if precision == 'bf16' else torch.float16):
+            with autocast("cuda", enabled=amp):
                 logits = model(sequence, return_joint_frame=True)[2]
             targets, valid = joint_frame_targets(batch[9], batch[10], batch[12])
             logits = logits[:, center_left:center_right]
@@ -61,7 +59,7 @@ def collect_sample(model, loader, device, center_left, center_right,
                 )
     return (
         torch.cat(sampled_logits), torch.cat(sampled_targets),
-        {"precision": precision, "valid_owned_bases_seen": seen_valid,
+        {"valid_owned_bases_seen": seen_valid,
          "coding_owned_bases_seen": seen_coding,
          "inference_seconds": time.time() - started},
     )
@@ -123,8 +121,7 @@ def main():
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--split", default="val")
     parser.add_argument("--output-dir", type=Path, required=True)
-    add_batch_arguments(parser)
-    add_device_argument(parser)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--samples-per-window", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -134,8 +131,8 @@ def main():
     parser.add_argument("--minimum-temperature", type=float, default=0.05)
     parser.add_argument("--maximum-temperature", type=float, default=100.0)
     args = parser.parse_args()
-    device = resolve_device(args.device)
-    configure_threads(args.threads, device)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required to collect calibration logits")
     if args.samples_per_window < 1:
         parser.error("--samples-per-window must be positive")
 
@@ -154,18 +151,17 @@ def main():
     dataset = PUDataset(
         args.data_root / args.split, require_phase=True, require_cds=True
     )
-    model = model_from_checkpoint(checkpoint, device).eval()
-    args.batch_size = configure_batch_size(args, model, window, device)
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=device.type == "cuda",
+        num_workers=args.workers, pin_memory=True,
         persistent_workers=args.workers > 0,
         prefetch_factor=2 if args.workers > 0 else None,
     )
+    device = torch.device("cuda")
+    model = model_from_checkpoint(checkpoint, device).eval()
     logits, targets, collection = collect_sample(
         model, loader, device, center_left, center_right,
         args.samples_per_window, args.seed, args.amp,
-        precision=args.precision,
     )
     noncoding_weight = float(config.get("joint_noncoding_weight", 0.1))
     empirical_temperature = fit_temperature(

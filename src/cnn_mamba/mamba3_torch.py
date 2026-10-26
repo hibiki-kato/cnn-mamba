@@ -8,7 +8,6 @@ SISO, without output RMSNorm or streaming caches.
 """
 
 import math
-from functools import lru_cache
 
 import torch
 from torch import nn
@@ -42,7 +41,7 @@ def _rotate(x, angles):
 
 def _scan_group(q, k, v, adt, dt, angles, q_bias, k_bias, skip, z,
                 gamma, scale, state, angle_state, chunk_size, local_noncausal):
-    """Evaluate a bounded group; also the compilation boundary on CUDA."""
+    """Evaluate a bounded group without sequence-length-squared scratch space."""
     batch, length, heads, width = v.shape
     cuda_ops = v.device.type == "cuda"
     blocks = (length + chunk_size - 1) // chunk_size
@@ -139,14 +138,8 @@ def _scan_group(q, k, v, adt, dt, angles, q_bias, k_bias, skip, z,
     return out[:, :length].to(v.dtype), state, angle_state
 
 
-@lru_cache(maxsize=1)
-def _compiled_scan_group():
-    # Lazy: CPU/MPS and the default eager path never invoke a compiler.
-    return torch.compile(_scan_group, fullgraph=True, dynamic=False)
-
-
 def siso_scan(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z,
-              chunk_size=64, chunks_per_group=16, *, compile_scan=False):
+              chunk_size=64, chunks_per_group=16):
     """Mamba3 scan with batched local blocks and parallel block-state propagation.
 
     All tensor arithmetic stays on the input device. The Python loop handles
@@ -157,8 +150,6 @@ def siso_scan(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z,
     """
     if chunk_size < 1 or chunks_per_group < 1:
         raise ValueError("chunk_size and chunks_per_group must be positive")
-    if compile_scan and (v.device.type != "cuda" or torch.is_grad_enabled()):
-        raise ValueError("compiled scan requires CUDA inference with gradients disabled")
     batch, length, heads, width = v.shape
     if length == 0:
         return v
@@ -178,10 +169,9 @@ def siso_scan(q, k, v, adt, dt, trap, angles, q_bias, k_bias, skip, z,
     ).triu()
     outputs = []
     group_size = chunk_size * chunks_per_group
-    group = _compiled_scan_group() if compile_scan else _scan_group
     for start in range(0, length, group_size):
         end = min(start + group_size, length)
-        out, state, angle_state = group(
+        out, state, angle_state = _scan_group(
             q[:, start:end], k[:, start:end], v[:, start:end], adt[:, start:end],
             dt[:, start:end], angles[:, start:end],
             q_bias, k_bias, skip, z[:, start:end], gamma[:, start:end],
@@ -202,7 +192,6 @@ class Mamba3Torch(nn.Module):
         self.d_inner = 2 * d_model
         self.chunk_size = chunk_size
         self.chunks_per_group = chunks_per_group
-        self.compile_scan = False
         if self.d_inner % headdim:
             raise ValueError("2 * d_model must be divisible by headdim")
         self.nheads = self.d_inner // headdim
@@ -253,13 +242,9 @@ class Mamba3Torch(nn.Module):
                 self.C_bias.squeeze(1), self.B_bias.squeeze(1), self.D, z)
 
     def forward(self, u):
-        if self.compile_scan and self.training:
-            raise ValueError("compiled scan requires eval() inference")
         batch, length, _ = u.shape
         values = self.prepare(self.in_proj(u))
-        # Outer autocast may use BF16 for projections, but recurrent state and
-        # scan matrix operations retain FP32 accumulation on every device.
+        # Preserve FP32 recurrent state and matrix arithmetic on every device.
         with torch.autocast(u.device.type, enabled=False):
-            y = siso_scan(*values, self.chunk_size, self.scan_group_size(batch, u.device),
-                          compile_scan=self.compile_scan)
+            y = siso_scan(*values, self.chunk_size, self.scan_group_size(batch, u.device))
         return self.out_proj(y.reshape(batch, length, self.d_inner))

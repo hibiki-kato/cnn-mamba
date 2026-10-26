@@ -16,7 +16,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision, completed_output
+from .inference import add_device_argument, configure_threads, resolve_device, resolve_batch_size
 
 ENCODE = np.full(256, 4, dtype=np.uint8)
 for _base, _value in (("A", 0), ("C", 1), ("G", 2), ("T", 3)):
@@ -87,10 +87,10 @@ def main() -> None:
     parser.add_argument("--fasta", type=Path, required=True)
     parser.add_argument("--chrom", required=True, help="FASTA accession/sequence name")
     parser.add_argument("--display-chrom", default="chrX")
-    add_batch_arguments(parser)
+    parser.add_argument("--batch-size", type=int)
     add_device_argument(parser)
     args = parser.parse_args()
-    if completed_output(args.output_dir, args.precision, args.compile_scan):
+    if (args.output_dir / ".complete.json").is_file():
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
@@ -98,12 +98,9 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     window = int(checkpoint["config"]["window_size"])
     stride = int(checkpoint["config"]["stride"])
+    batch_size = resolve_batch_size(args.batch_size, device, {5000: 8, 10000: 4, 20000: 2}.get(window, 1))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model = model_from_checkpoint(checkpoint, device).eval()
-    if args.compile_scan:
-        model.enable_compiled_scan()
-    batch_size = configure_batch_size(args, model, window, device)
-    print(f"device={device} backend=torch batch_size={batch_size}", flush=True)
     fasta = pysam.FastaFile(str(args.fasta))
     chrom_len = fasta.get_reference_length(args.chrom)
     counts = count_candidates(fasta, args.chrom, chrom_len)
@@ -125,9 +122,9 @@ def main() -> None:
             encoded.append(encode(text + "N" * (window - len(text))))
         encoded = np.stack(encoded)
         tensor = torch.from_numpy(encoded).long().to(device)
-        with torch.inference_mode(), inference_precision(args.precision, device):
+        with torch.inference_mode():
             splice, start_stop = model(tensor)
-            splice, start_stop = splice.float().softmax(-1).cpu().numpy(), start_stop.float().softmax(-1).cpu().numpy()
+            splice, start_stop = splice.softmax(-1).float().cpu().numpy(), start_stop.softmax(-1).float().cpu().numpy()
         for local_index, (start, sequence) in enumerate(zip(batch_starts, encoded)):
             index = batch_start + local_index
             left, right = keep_bounds(index, len(starts), window, stride)
@@ -159,7 +156,7 @@ def main() -> None:
         for array in arrays[name].values():
             array.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "precision": args.precision, "compile_scan": args.compile_scan, "threads": torch.get_num_threads(), "batch_size": batch_size,
+        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(),
         "schema": "droso_chrx_all_candidate_scores_v1", "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_step": checkpoint.get("optimizer_step"),
         "checkpoint_epoch": checkpoint.get("epoch"),

@@ -13,7 +13,7 @@ import pysam
 import torch
 
 from .model import model_from_checkpoint
-from .inference import add_batch_arguments, add_device_argument, configure_batch_size, configure_threads, resolve_device, inference_precision, completed_output
+from .inference import add_device_argument, configure_threads, resolve_device, resolve_batch_size
 from .score_chromosome import encode, keep_bounds
 
 
@@ -24,8 +24,7 @@ def main():
     parser.add_argument("--chrom", required=True)
     parser.add_argument("--display-chrom", default="chrX")
     parser.add_argument("--output-dir", type=Path, required=True)
-    add_batch_arguments(parser)
-    add_device_argument(parser)
+    parser.add_argument("--batch-size", type=int)
     parser.add_argument(
         "--write-raw-phase", action="store_true",
         help="Also persist the ungated phase softmax for direct comparison.",
@@ -34,13 +33,15 @@ def main():
         "--reference-phase-probabilities", type=Path,
         help="Optional original raw phase array used to prove the frozen model is unchanged.",
     )
+    add_device_argument(parser)
     args = parser.parse_args()
     sentinel = args.output_dir / ".complete.json"
-    if completed_output(args.output_dir, args.precision, args.compile_scan):
+    if sentinel.is_file():
         print(f"already complete: {args.output_dir}", flush=True)
         return
     device = resolve_device(args.device)
     configure_threads(args.threads, device)
+    args.batch_size = resolve_batch_size(args.batch_size, device, 8)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
@@ -89,14 +90,10 @@ def main():
             )
 
     model = model_from_checkpoint(checkpoint, device).eval()
-    if args.compile_scan:
-        model.enable_compiled_scan()
-    args.batch_size = configure_batch_size(args, model, window, device)
-    print(f"device={device} backend=torch batch_size={args.batch_size}", flush=True)
     expected_position = 0
     max_phase_difference = 0.0
     started = time.time()
-    with torch.inference_mode(), inference_precision(args.precision, device):
+    with torch.inference_mode():
         for batch_start in range(0, len(starts), args.batch_size):
             batch_starts = starts[batch_start:batch_start + args.batch_size]
             encoded = []
@@ -109,8 +106,8 @@ def main():
             _, _, phase_logits, cds_logits = model(
                 sequence, return_phase=True, return_cds=True
             )
-            phase_values = phase_logits.float().softmax(-1).cpu().numpy()
-            cds_values = cds_logits.float().softmax(-1)[..., 1].cpu().numpy()
+            phase_values = phase_logits.softmax(-1).float().cpu().numpy()
+            cds_values = cds_logits.softmax(-1)[..., 1].float().cpu().numpy()
 
             for local_index, start in enumerate(batch_starts):
                 window_index = batch_start + local_index
@@ -155,7 +152,7 @@ def main():
         raw_phase.flush()
     joint_argmax.flush()
     metadata = {
-        "device": str(device), "backend": "torch", "precision": args.precision, "compile_scan": args.compile_scan, "threads": torch.get_num_threads(), "batch_size": args.batch_size,
+        "device": str(device), "backend": "torch", "threads": torch.get_num_threads(),
         "schema": "cds_gated_phase_probabilities_v1",
         "checkpoint": str(args.checkpoint.resolve()),
         "checkpoint_epoch": int(checkpoint["epoch"]),

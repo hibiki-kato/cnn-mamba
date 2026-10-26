@@ -1,80 +1,20 @@
-"""Device and memory-aware batching shared by PyTorch inference commands."""
+"""Shared device, thread and batch defaults for portable inference."""
 
-import argparse
-import json
 import os
-import subprocess
 import sys
 
 import torch
 
 
-def _batch_size(value):
-    if value == "auto":
-        return value
-    try:
-        size = int(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("batch size must be 'auto' or a positive integer") from error
-    if size < 1:
-        raise argparse.ArgumentTypeError("batch size must be positive")
-    return size
 
-
-def add_batch_arguments(parser, default=None):
+def add_device_argument(parser, threads_default=None):
     parser.add_argument(
-        "--batch-size", type=_batch_size, default=default,
-        help="Positive integer or auto. Default: auto on accelerators, 1 on CPU.",
+        "--device", default="auto",
+        help="auto (CUDA/ROCm, then MPS, then CPU), cpu, mps, cuda, or cuda:N. "
+             "All devices use pure PyTorch inference.",
     )
-    parser.add_argument("--memory-fraction", type=float, default=0.5,
-                        help="Fraction of hardware capacity used for auto batch sizing (default: 0.5).")
-    parser.add_argument("--memory-gb", type=float,
-                        help="Override hardware capacity in GiB, e.g. an HPC job's allocation.")
-    parser.add_argument("--max-batch-size", type=int, default=32,
-                        help="Upper bound for auto batch sizing (default: 32).")
-
-
-def hardware_memory(device):
-    """Read fixed device capacity; never inspect current memory usage."""
-    if device.type == "cuda":
-        return torch.cuda.get_device_properties(device).total_memory
-    try:
-        if sys.platform == "darwin":
-            total = int(subprocess.check_output(["/usr/sbin/sysctl", "-n", "hw.memsize"], text=True))
-        else:
-            total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, AttributeError, subprocess.CalledProcessError):
-        return 0
-    if device.type == "mps":
-        total = min(total, torch.mps.recommended_max_memory())
-    return total
-
-
-def configure_batch_size(args, model, window, device):
-    """Choose a batch once from hardware capacity and model/window dimensions.
-
-    The conservative estimate includes full-length projections, residuals and
-    FP32 scan intermediates. Explicit sizes take priority. No runtime memory
-    monitoring, trial forwards, or automatic retries are performed.
-    """
-    if not 0 < args.memory_fraction <= 1:
-        raise ValueError("memory fraction must be in (0, 1]")
-    if args.max_batch_size < 1:
-        raise ValueError("max batch size must be positive")
-    if args.memory_gb is not None and not args.memory_gb > 0:
-        raise ValueError("memory capacity must be positive")
-    if isinstance(args.batch_size, int):
-        return args.batch_size
-    if args.batch_size is None and device.type == "cpu":
-        return 1
-    d_model = model.embedding.embedding_dim
-    d_state = max((getattr(layer, "d_state", 0) for layer in model.modules()), default=0)
-    per_window = 4 * (window * (32 * d_model + 8 * d_state)
-                      + 16 * d_model * d_state)
-    memory = hardware_memory(device) if args.memory_gb is None else args.memory_gb * 1024**3
-    capacity = max(1, int(memory * args.memory_fraction) // per_window)
-    capacity = min(capacity, args.max_batch_size)
-    return 1 << (capacity.bit_length() - 1)
+    parser.add_argument("--threads", type=int, default=threads_default,
+                        help="CPU threads; overrides OMP/MKL settings. Defaults respect job allocation.")
 
 
 def configure_threads(requested, device):
@@ -96,43 +36,6 @@ def configure_threads(requested, device):
     return torch.get_num_threads()
 
 
-def add_device_argument(parser, threads_default=None):
-    parser.add_argument(
-        "--device", default="auto",
-        help="auto (CUDA/ROCm, then MPS, then CPU), cpu, mps, cuda, or cuda:N. "
-             "All devices use pure PyTorch inference.",
-    )
-    parser.add_argument("--threads", type=int, default=threads_default,
-                        help="CPU threads; overrides OMP/MKL settings. Defaults respect job allocation.")
-    parser.add_argument('--precision', choices=('fp32', 'bf16'), default='fp32',
-                        help='BF16 projections/CNN with FP32 scan accumulation; scores can differ. Default: fp32.')
-    parser.add_argument('--compile-scan', action='store_true',
-                        help='Opt into torch.compile for CUDA scan operations. Adds initial compilation time; '
-                             'scores can differ slightly. Default: eager PyTorch.')
-
-
-def inference_precision(precision, device):
-    """Explicit optional mixed precision; never switch dtype based on timing."""
-    if precision not in {'fp32', 'bf16'}:
-        raise ValueError(f'unsupported inference precision: {precision}')
-    return torch.autocast(device.type, dtype=torch.bfloat16, enabled=precision == 'bf16')
-
-
-def completed_output(output_dir, precision, compile_scan=False):
-    """Reuse completed scores only when precision and scan execution match."""
-    if not (output_dir / '.complete.json').is_file():
-        return False
-    metadata = json.loads((output_dir / 'metadata.json').read_text())
-    previous = metadata.get('precision', 'fp32')
-    if previous != precision:
-        raise ValueError(f'completed output uses precision {previous}, requested {precision}; '
-                         'choose a different output directory')
-    if metadata.get('compile_scan', False) != compile_scan:
-        raise ValueError('completed output uses a different compile-scan setting; '
-                         'choose a different output directory')
-    return True
-
-
 def resolve_device(name="auto"):
     if name == "auto":
         if torch.cuda.is_available():
@@ -148,3 +51,10 @@ def resolve_device(name="auto"):
     if device.type == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("MPS is unavailable; use --device cpu")
     return device
+
+
+def resolve_batch_size(requested, device, accelerator_default):
+    size = requested if requested is not None else (1 if device.type == "cpu" else accelerator_default)
+    if size < 1:
+        raise ValueError("batch size must be positive")
+    return size

@@ -17,7 +17,6 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 
 from .model import SpliceMamba
-from .training_runtime import add_training_runtime_arguments, configure_training_runtime, amp_dtype
 from .common import (
     BinnedPR,
     format_metrics,
@@ -278,7 +277,6 @@ def evaluate(
     splice_loss_weight=0.25, phase_aux_weight=0.0, cds_aux_weight=0.0,
     cds_boundary_radius=0, cds_far_loss_weight=0.1,
     joint_frame_aux_weight=0.0, joint_noncoding_weight=0.1,
-    autocast_dtype=torch.float16,
 ):
     model.eval()
     curves = {name: BinnedPR() for name in ("donor", "acceptor", "start", "stop")}
@@ -293,7 +291,7 @@ def evaluate(
         sequence = batch[0].to(device, non_blocking=True)
         chess_splice = batch[5].to(device, non_blocking=True)
         chess_ss = batch[6].to(device, non_blocking=True)
-        with autocast("cuda", enabled=use_amp, dtype=autocast_dtype):
+        with autocast("cuda", enabled=use_amp):
             if (
                 phase_aux_weight > 0 or cds_aux_weight > 0
                 or joint_frame_aux_weight > 0
@@ -430,7 +428,8 @@ def main():
             "training maximum is longer, LR remains at 0.1x after this horizon."
         ),
     )
-    add_training_runtime_arguments(parser)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument(
@@ -535,6 +534,7 @@ def main():
     )
     parser.add_argument("--window-size", type=int, default=10000)
     parser.add_argument("--stride", type=int, default=5000)
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument(
         "--gradient-checkpointing",
         action="store_true",
@@ -673,11 +673,6 @@ def main():
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
     device = torch.device("cuda")
-    try:
-        runtime = configure_training_runtime(args, device, args.window_size)
-    except ValueError as error:
-        parser.error(str(error))
-    autocast_dtype = amp_dtype(args.amp_dtype)
     output_dir = (args.output_dir or (
         ROOT / f"checkpoints_hsap_eviann_pu_pilot_{args.mode}"
     )).resolve()
@@ -691,7 +686,6 @@ def main():
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     logger.addHandler(logging.StreamHandler(sys.stdout))
-    logger.info(f"training runtime: {runtime}")
 
     require_phase = (
         args.phase_aux_weight > 0 or args.joint_frame_aux_weight > 0
@@ -789,7 +783,6 @@ def main():
             )
 
     model = SpliceMamba(
-        backend="triton",
         d_model=192,
         d_state=64,
         n_layers=8,
@@ -802,8 +795,6 @@ def main():
         joint_frame_auxiliary=args.joint_frame_aux_weight > 0,
     ).to(device)
     model.gradient_checkpointing = args.gradient_checkpointing
-    if args.fuse_bidirectional:
-        model.enable_bidirectional_fusion()
     initialize_like_original(model)
     backbone_prefixes = (
         "embedding.", "input_proj.", "layers.", "norms.", "final_norm.",
@@ -930,7 +921,7 @@ def main():
     frozen_parameter_count = sum(
         parameter.numel() for _, parameter in frozen_parameters
     )
-    scaler = GradScaler(enabled=args.amp and autocast_dtype == torch.float16)
+    scaler = GradScaler(enabled=args.amp)
     steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     scheduler_epochs = args.scheduler_epochs or args.epochs
     scheduler_steps = scheduler_epochs * steps_per_epoch
@@ -946,7 +937,7 @@ def main():
         saved = torch.load(last_checkpoint, map_location="cpu", weights_only=True)
         model.load_state_dict(saved["model_state_dict"])
         optimizer.load_state_dict(saved["optimizer_state_dict"])
-        if scaler.is_enabled() and saved.get("scaler_state_dict"):
+        if args.amp and "scaler_state_dict" in saved:
             scaler.load_state_dict(saved["scaler_state_dict"])
         if "data_generator_state" in saved:
             generator.set_state(saved["data_generator_state"])
@@ -1007,7 +998,7 @@ def main():
                 for tensor in gradient_probe
             )
             probe_sequence = probe_batch[0]
-            with autocast("cuda", enabled=args.amp, dtype=autocast_dtype):
+            with autocast("cuda", enabled=args.amp):
                 probe_outputs = model(
                     probe_sequence,
                     return_phase=args.phase_aux_weight > 0,
@@ -1144,7 +1135,7 @@ def main():
                         for name, values in epoch_gradient_norms.items()
                     )
                 )
-            with autocast("cuda", enabled=args.amp, dtype=autocast_dtype):
+            with autocast("cuda", enabled=args.amp):
                 if (
                     args.phase_aux_weight > 0 or args.cds_aux_weight > 0
                     or args.joint_frame_aux_weight > 0
@@ -1276,7 +1267,6 @@ def main():
                 args.cds_far_loss_weight,
                 args.joint_frame_aux_weight,
                 args.joint_noncoding_weight,
-                autocast_dtype=autocast_dtype,
             )
         mean_ap = None if metrics is None else sum(
             metrics[name]["AP"]
@@ -1379,7 +1369,6 @@ def main():
             "best_validation_mean_AP": None if metrics is None else best_score,
             "epochs_without_improvement": epochs_without_improvement,
             "config": vars(args) | {
-                "batch_policy": runtime,
                 "data_root": str(args.data_root), "output_dir": str(output_dir),
                 "init_checkpoint": (
                     None if args.init_checkpoint is None
@@ -1431,7 +1420,6 @@ def main():
             args.cds_far_loss_weight,
             args.joint_frame_aux_weight,
             args.joint_noncoding_weight,
-            autocast_dtype=autocast_dtype,
         )
     result = {
         "mode": args.mode,
