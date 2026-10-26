@@ -100,7 +100,7 @@ def main() -> None:
     stride = int(checkpoint["config"]["stride"])
     batch_size = resolve_batch_size(args.batch_size, device, {5000: 8, 10000: 4, 20000: 2}.get(window, 1))
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    model = model_from_checkpoint(checkpoint, device).eval()
+    model = model_from_checkpoint(checkpoint, device, backend="torch").eval()
     fasta = pysam.FastaFile(str(args.fasta))
     chrom_len = fasta.get_reference_length(args.chrom)
     counts = count_candidates(fasta, args.chrom, chrom_len)

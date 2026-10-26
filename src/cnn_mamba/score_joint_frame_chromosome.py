@@ -105,7 +105,7 @@ def main():
             dtype=np.float32, shape=(chrom_len, 4),
         )
 
-    model = model_from_checkpoint(checkpoint, device).eval()
+    model = model_from_checkpoint(checkpoint, device, backend="torch").eval()
     vector_scale_tensor = (
         None if vector_scale is None
         else torch.tensor(vector_scale, dtype=torch.float32, device=device)

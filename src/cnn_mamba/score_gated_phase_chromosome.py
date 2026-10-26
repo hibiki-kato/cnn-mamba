@@ -89,7 +89,7 @@ def main():
                 f"reference phase shape {reference.shape} != {(chrom_len, 3)}"
             )
 
-    model = model_from_checkpoint(checkpoint, device).eval()
+    model = model_from_checkpoint(checkpoint, device, backend="torch").eval()
     expected_position = 0
     max_phase_difference = 0.0
     started = time.time()

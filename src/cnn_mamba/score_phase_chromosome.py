@@ -63,7 +63,7 @@ def main():
         dtype=np.uint8, shape=(chrom_len,),
     )
 
-    model = model_from_checkpoint(checkpoint, device).eval()
+    model = model_from_checkpoint(checkpoint, device, backend="torch").eval()
     started = time.time()
     expected_position = 0
     with torch.inference_mode():

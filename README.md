@@ -67,10 +67,11 @@ cnn-mamba-score --checkpoint /path/to/model.pt --fasta /path/to/indexed.fa \
   --device cpu --threads 8 --batch-size 1
 ```
 
-`model_from_checkpoint(saved, device)` selects PyTorch inference while preserving
-the architecture, checkpoint keys and forward interface. `SpliceMamba(...)`
-keeps the native backend default for existing training code; explicit callers
-can select `backend="torch"`. Training dependencies are in the `train` extra.
+`model_from_checkpoint(saved, device, backend="torch")` selects PyTorch while
+preserving the architecture, checkpoint keys and forward interface. The four
+scorers select it explicitly. Model construction/checkpoint loading keep their
+native default for existing training/calibration callers. Training dependencies
+are in the `train` extra.
 Use a fresh output directory when switching from native inference: its internal
 BF16 arithmetic differs from the portable FP32 scan, so scores are not guaranteed
 identical. Regression checks are part of the existing `tests/test_core.py`.

@@ -184,11 +184,11 @@ class SpliceMamba(nn.Module):
         return outputs
 
 
-def model_from_checkpoint(saved, device=None):
+def model_from_checkpoint(saved, device=None, backend="triton"):
     config = saved.get("config", {})
     state = saved["model_state_dict"]
     model = SpliceMamba(
-        backend="torch",
+        backend=backend,
         d_model=config.get("d_model", 192), d_state=config.get("d_state", 64),
         n_layers=config.get("n_layers", 8), dropout=config.get("dropout", 0.1),
         architecture=config.get("architecture", "cnn_mamba"),
